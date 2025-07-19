@@ -33,13 +33,11 @@ function Test-Permission {
     )
     foreach ($entry in $PermissionEntries) {
         foreach ($allowed in $entry.actions) {
-            # Replace escaped wildcard characters so that permissions with
-            # wildcards like "Microsoft.Sql/servers/*" are matched correctly.
-            $regex = [regex]::Escape($allowed) -replace '\\*', '.*'
+            $regex = [regex]::Escape($allowed) -replace '\\\*', '.*'
             if ($RequiredPermission -match "^$regex$") {
                 $excluded = $false
                 foreach ($denied in $entry.notActions) {
-                    $nregex = [regex]::Escape($denied) -replace '\\*', '.*'
+                    $nregex = [regex]::Escape($denied) -replace '\\\*', '.*'
                     if ($RequiredPermission -match "^$nregex$") {
                         $excluded = $true
                         break
@@ -57,7 +55,6 @@ function Test-Permission {
 # Get all subscriptions
 $subscriptions = Get-AzSubscription
 $results = @()
-$detailedResults = @()
 
 foreach ($sub in $subscriptions) {
     Write-Output "Processing subscription: $($sub.Name) ($($sub.Id))"
@@ -95,21 +92,11 @@ foreach ($sub in $subscriptions) {
             if ($databases) {
                 foreach ($db in $databases) {
                     $sqlInstanceCount++
-                    $dbSizeTB = 0
                     if ($db.MaxSizeBytes) {
                         $parsedValue = 0
                         if ([long]::TryParse($db.MaxSizeBytes.ToString(), [ref]$parsedValue)) {
                             $totalSQLSizeBytes += $parsedValue
-                            $dbSizeTB = [math]::Round($parsedValue / $oneTBBytes, 2)
                         }
-                    }
-                    $detailedResults += [pscustomobject]@{
-                        SubscriptionName  = $sub.Name
-                        SubscriptionId    = $sub.Id
-                        ResourceGroupName = $server.ResourceGroupName
-                        ResourceType      = 'SQLDatabase'
-                        ResourceName      = $db.DatabaseName
-                        SizeTB            = $dbSizeTB
                     }
                 }
             }
@@ -136,14 +123,6 @@ foreach ($sub in $subscriptions) {
                 }
             }
             $totalDiskSizeGB += $vmDiskSizeGB
-            $detailedResults += [pscustomobject]@{
-                SubscriptionName  = $sub.Name
-                SubscriptionId    = $sub.Id
-                ResourceGroupName = $vm.ResourceGroupName
-                ResourceType      = 'VirtualMachine'
-                ResourceName      = $vm.Name
-                SizeGB            = $vmDiskSizeGB
-            }
         }
     }
     $totalDiskSizeTB = [math]::Round($totalDiskSizeGB / $oneTBGB, 2)
@@ -167,8 +146,3 @@ Write-Output "Total subscriptions processed: $($results.Count)"
 $csvPath = Join-Path -Path (Get-Location) -ChildPath "AzureResourceSizes.csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Force
 Write-Output "Results have been written to CSV file: $csvPath"
-
-# Write detailed object information to CSV for further analysis
-$detailsPath = Join-Path -Path (Get-Location) -ChildPath "AzureResourceDetails.csv"
-$detailedResults | Export-Csv -Path $detailsPath -NoTypeInformation -Force
-Write-Output "Detailed results have been written to CSV file: $detailsPath"
