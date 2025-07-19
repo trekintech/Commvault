@@ -1,112 +1,117 @@
-# Azure Resource Sizer Script - README
+# Azure Size Collector
 
-## Overview
+**Azure Size Collector** is a PowerShell script that inventories:
 
-The Azure Resource Sizer script is a PowerShell utility designed to collate resource usage information across multiple Azure subscriptions. It gathers data for two primary resource types:
+* **Azure SQL Databases** (counts and total size)
+* **Azure Virtual Machines** (counts and total OS + data disk sizes)
 
-- **Azure SQL Databases:**  
-  - Enumerates all SQL Servers and their databases in each subscription.
-  - Totals the maximum allocated size (using the `MaxSizeBytes` property) for all databases.
-  - Counts the number of SQL database instances.
+across **all** subscriptions accessible by your account, and exports:
 
-- **Azure Virtual Machines and Attached Disks:**  
-  - Enumerates all Virtual Machines in each subscription.
-  - Retrieves and sums the sizes of the OS disk and any attached data disks.
-  - Counts the number of VMs processed.
+* **Summary CSV**: one row per subscription with aggregate metrics (GiB & TiB)
+* **Details CSV**: one row per resource (SQL DB or VM) with individual sizes (GiB & TiB)
 
-Both sizes are converted to terabytes (TB) with two decimal precision. The script displays the results on-screen and writes them to a CSV file named `AzureResourceSizes.csv`.
+---
 
-## Prerequisites
+## 📦 Prerequisites
 
-### PowerShell Version
+1. **PowerShell** (Core 7+ or Windows PowerShell 5.1)
+2. **Internet access** to install modules and authenticate
 
-Ensure you are running an up-to-date version of PowerShell.
+### Required PowerShell Modules
 
-### Required Modules
+The script will auto-install these if missing:
 
-The script uses the following Azure PowerShell modules:
-- **Az.Accounts** (for connecting to Azure, managing contexts, and subscriptions)
-- **Az.Sql** (for retrieving SQL Server and SQL Database information)
-- **Az.Compute** (for retrieving Virtual Machine and disk information)
-- **Az.Resources** (for invoking REST methods and managing subscriptions)
+* `Az.Accounts`
+* `Az.Sql`
+* `Az.Compute`
+* `Az.Resources`
+* `Az.Storage`
 
-The script includes module checks and will automatically install any missing modules in the current user scope.
+You can pre-install the full Az bundle with:
 
-## Required Azure Permissions
+```powershell
+Install-Module -Name Az -AllowClobber -Scope CurrentUser
+```
 
-The script requires the following read-only permissions in order to successfully retrieve resource details:
+### Azure RBAC Permissions
 
-- **Microsoft.Sql/servers/read**  
-  Required to list SQL Servers.
-  
-- **Microsoft.Sql/servers/databases/read**  
-  Required to list SQL Databases within each server.
+On each subscription you scan, your identity needs at least **Reader** role (or equivalent) for these actions:
 
-- **Microsoft.Compute/virtualMachines/read**  
-  Required to enumerate Virtual Machines.
+* **Resources**
 
-- **Microsoft.Compute/disks/read**  
-  Required to retrieve information about attached disks.
+  * `Microsoft.Resources/subscriptions/read`
+* **SQL**
 
-- **Microsoft.Resources/subscriptions/read**  
-  Required to list and access subscription details.
+  * `Microsoft.Sql/servers/read`
+  * `Microsoft.Sql/servers/databases/read`
+* **Compute & Disks**
 
-These permissions ensure that the script can access the necessary resource information without making any changes to your Azure environment.
+  * `Microsoft.Compute/virtualMachines/read`
+  * `Microsoft.Compute/disks/read`
+* **Storage** (for unmanaged VHDs)
 
-## How to Run the Script
+  * `Microsoft.Storage/storageAccounts/listKeys/read`
+* **Authorization** (permission checks)
 
-1. **Download/Copy the Script:**  
-   Save the provided PowerShell script as `AzureResourceSizer.ps1` or a similar filename.
+  * `Microsoft.Authorization/permissions/read`
 
-2. **Open PowerShell:**  
-   Open a PowerShell window with appropriate privileges.
+> Reader role on the subscription covers most; storage-account access is only needed if you have unmanaged VHDs.
 
-3. **Navigate to the Script Location:**  
-   Change directory to where the script is saved.
+---
 
-4. **Execute the Script:**  
-   Run the script by typing:
+## ⚙️ Installation
+
+1. Clone or download this repository.
+2. Ensure `Collect-AzureSizes.ps1` and this `README.md` are in the same folder.
+3. Open PowerShell (no elevation required).
+
+---
+
+## 🚀 Usage
+
+1. Change into the project directory:
+
+   ```powershell
+   cd C:\path\to\AzureSizeCollector
    ```
-   .\AzureResourceSizer.ps1
+2. Run the script:
+
+   ```powershell
+   .\Collect-AzureSizes.ps1
    ```
-   The script will:
-   - Check for and install any missing Azure modules.
-   - Connect to your Azure account (you will be prompted to sign in if not already connected).
-   - Process all accessible subscriptions, verifying required permissions before gathering resource details.
-   - Display the results in a formatted table on-screen.
-   - Write the results to a CSV file named `AzureResourceSizes.csv` in the current directory.
+3. Authenticate via device code when prompted.
+4. Watch progress logs for each subscription, SQL database, and VM.
 
-## Inputs and Configuration
+When complete, look for:
 
-- **User Inputs:**  
-  No manual inputs are required at runtime. The script is self-contained and automatically handles:
-  - Module installation
-  - Azure authentication
-  - Subscription processing and permission verification
+* **`Azure_SQL_VM_Summary.csv`**
+* **`Azure_SQL_VM_Details.csv`**
 
-- **Configuration:**  
-  All configuration is handled within the script. If you need to modify any thresholds or conversion factors, you can adjust the constants at the beginning of the script.
+in the same folder.
 
-## Output
+---
 
-- **On-Screen Display:**  
-  A formatted table is printed to the console showing:
-  - Subscription Name
-  - Subscription ID
-  - Number of SQL Database instances
-  - Total SQL Database size in TB
-  - Number of Virtual Machines
-  - Total disk size (OS + Data Disks) in TB
+## 📊 Output
 
-- **CSV File:**  
-  A CSV file named `AzureResourceSizes.csv` is generated in the current working directory containing the same information.
+### Summary CSV (`Azure_SQL_VM_Summary.csv`)
 
-## Notes
+| SubscriptionName | SubscriptionId | SQLInstanceCount | TotalSQLSizeGiB | TotalSQLSizeTiB | VMCount | TotalDiskSizeGiB | TotalDiskSizeTiB |
+| ---------------- | -------------- | ---------------- | --------------- | --------------- | ------- | ---------------- | ---------------- |
+| ExampleSub       | xxxxxxxx-xxxx  | 10               | 512.00          | 0.50            | 5       | 1024.00          | 1.00             |
 
-- **Permissions:**  
-  Ensure that your Azure account has the required permissions for the subscriptions you wish to analyze. If any subscription is missing the necessary permissions, the script will skip that subscription and notify you.
+### Details CSV (`Azure_SQL_VM_Details.csv`)
 
-- **Module Installation:**  
-  The script automatically installs any missing required modules in the current user scope, so an internet connection is needed for the initial run if modules are missing.
+| SubscriptionName | ResourceGroupName | ResourceType   | ResourceName | SizeGiB | SizeTiB |
+| ---------------- | ----------------- | -------------- | ------------ | ------- | ------- |
+| ExampleSub       | RG-SQL            | SQLDatabase    | MyDatabase   | 256.00  | 0.25    |
+| ExampleSub       | RG-VM             | VirtualMachine | WebServer01  | 128.00  | 0.125   |
 
-This README provides a complete overview of the script's functionality, prerequisites, permissions required, and instructions for running the tool. Enjoy using the Azure Resource Sizer!
+---
+
+## 🔧 Customization
+
+* **Filter subscriptions**: add `| Where-Object { … }` after `Get-AzSubscription`.
+* **Output paths**: edit the `Export-Csv` filenames at the bottom of the script.
+* **Unit adjustments**: modify `$oneTiBBytes` / `$oneGiBBytes` constants.
+
+---
