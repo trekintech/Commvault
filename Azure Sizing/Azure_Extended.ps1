@@ -73,7 +73,7 @@ param (
   [switch]$AggregateStorageAtAccountLevel
 )
 
-$ScriptVersion = "3.4.0"
+$ScriptVersion = "3.4.1"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
 # Quiet deprecation spam from Get-AzMetric
@@ -150,7 +150,7 @@ function Add-Aggregate {
 function New-List { New-Object System.Collections.ArrayList }
 function Add-ListItem { param([System.Collections.ArrayList]$List,[object]$Item) [void]$List.Add($Item) }
 
-# Generic metrics helper
+# ===== CHANGED: Generic metrics helper with Aggregation/TimeGrain params (defaults keep old behaviour) =====
 function Get-MetricBytes {
   param(
     [Parameter(Mandatory)][string]$ResourceId,
@@ -158,24 +158,28 @@ function Get-MetricBytes {
     [int]$Days = 2,
     [string]$MetricNamespace,
     [string]$Filter,
-    [hashtable]$Dimensions
+    [hashtable]$Dimensions,
+    [ValidateSet('Average','Minimum','Maximum','Total','Count')]
+    [string]$AggregationType = 'Average',
+    [TimeSpan]$TimeGrain = ([TimeSpan]::Parse('01:00:00'))
   )
   try {
     $end = Get-Date; $start = $end.AddDays(-[math]::Max(1,$Days))
     $args = @{
-      ResourceId   = $ResourceId
-      MetricName   = $MetricName
-      StartTime    = $start
-      EndTime      = $end
-      TimeGrain    = [TimeSpan]::Parse("01:00:00")
-      AggregationType = 'Average'
-      ErrorAction  = 'SilentlyContinue'
-      WarningAction= 'SilentlyContinue'
+      ResourceId      = $ResourceId
+      MetricName      = $MetricName
+      StartTime       = $start
+      EndTime         = $end
+      TimeGrain       = $TimeGrain
+      AggregationType = $AggregationType
+      ErrorAction     = 'SilentlyContinue'
+      WarningAction   = 'SilentlyContinue'
     }
     if ($MetricNamespace) { $args.MetricNamespace = $MetricNamespace }
     if ($Filter) { $args.Filter = $Filter }
     elseif ($Dimensions) {
-      $pairs = @(); foreach ($k in $Dimensions.Keys) { $pairs += ("{0} eq '{1}'" -f $k,$Dimensions[$k].ToString().Replace("'","''")) }
+      $pairs = @()
+      foreach ($k in $Dimensions.Keys) { $pairs += ("{0} eq '{1}'" -f $k,$Dimensions[$k].ToString().Replace("'","''")) }
       if ($pairs.Count) { $args.Filter = ($pairs -join ' and ') }
     }
 
@@ -184,16 +188,15 @@ function Get-MetricBytes {
 
     $series = @(); foreach ($md in $m) { $series += $md.Timeseries }
     if (-not $series) { $series = $m.Timeseries }
-
     $points = @(); foreach ($ts in $series) { $points += $ts.Data }
     if (-not $points) { $points = $m.Data }
 
-    $val = $points | Where-Object { $_.Average -ne $null } | Select-Object -Last 1
-    if ($val) { return [double]$val.Average } else { return 0.0 }
+    $val = $points | Where-Object { $_.$AggregationType -ne $null } | Select-Object -Last 1
+    if ($val) { return [double]$val.$AggregationType } else { return 0.0 }
   } catch { return 0.0 }
 }
 
-# Azure Files per-share via metric (fallback to ShareStats)
+# ===== CHANGED: Files share usage with daily/MAX, proper namespace, and robust fallbacks =====
 function Get-FileShareUsedBytes {
   param(
     [Parameter(Mandatory)][string]$StorageAccountId,
@@ -201,11 +204,26 @@ function Get-FileShareUsedBytes {
     $Context
   )
   $rid = "$StorageAccountId/fileServices/default"
-  $bytes = Get-MetricBytes -ResourceId $rid `
-           -MetricName 'FileCapacity' `
-           -MetricNamespace 'Microsoft.Storage/storageAccounts/fileServices' `
-           -Filter ("ShareName eq '{0}'" -f $ShareName)
+  $ns  = 'Microsoft.Storage/storageAccounts/fileServices'
+
+  # 1) Most reliable: daily/MAX filtered by ShareName (exact case)
+  $flt = "ShareName eq '$ShareName'"
+  $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
+           -AggregationType Maximum -TimeGrain ([TimeSpan]::Parse('1.00:00:00')) -Days 3 -Filter $flt
   if ($bytes -gt 0) { return $bytes }
+
+  # 2) Fallback: try lowercased dimension value (some tenants normalize dimension values)
+  $flt2 = "ShareName eq '$($ShareName.ToLower())'"
+  $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
+           -AggregationType Maximum -TimeGrain ([TimeSpan]::Parse('1.00:00:00')) -Days 3 -Filter $flt2
+  if ($bytes -gt 0) { return $bytes }
+
+  # 3) Fallback: hourly/AVG (older accounts sometimes only emit hourly)
+  $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
+           -AggregationType Average -TimeGrain ([TimeSpan]::Parse('01:00:00')) -Days 2 -Filter $flt
+  if ($bytes -gt 0) { return $bytes }
+
+  # 4) Data-plane stats (requires data-plane permission or key/SAS)
   try {
     if ($Context) {
       $sh = Get-AzStorageShare -Context $Context -Name $ShareName -ErrorAction SilentlyContinue
@@ -215,6 +233,7 @@ function Get-FileShareUsedBytes {
       }
     }
   } catch {}
+
   return 0.0
 }
 
@@ -401,14 +420,12 @@ function Collect-Storage {
     })
 
     # Aggregation behavior:
-    # - If Account-level mode: aggregate the whole account, skip per-service aggregations (no double count).
-    # - Else (default): aggregate per service; DO NOT aggregate the whole account (no double count).
     if ($AggregateStorageAtAccountLevel) {
       Add-Aggregate -Map $Aggregates -App 'Storage Account' -Region $loc -SizeBytes $acctBytes
       continue
     }
 
-    # ADLS Gen2: keep as detail only (no separate aggregation to avoid duplication with blob service)
+    # ADLS Gen2: detail only
     if ($sa.EnableHierarchicalNamespace) {
       Add-ListItem -List $AllDataLakeGen2 -Item ([pscustomobject]@{
         SubscriptionId=$SubId; ResourceGroup=(Anon-RG $sa.ResourceGroupName); StorageAccountName=(Anon-Obj $sa.StorageAccountName 'stg-');
@@ -430,7 +447,7 @@ function Collect-Storage {
         Add-Aggregate -Map $Aggregates -App 'Azure Files' -Region $loc -SizeBytes $usageBytes
       }
 
-      # Table Storage
+      # Table Storage (service metric)
       $tableSvcId = "$($sa.Id)/tableServices/default"
       $tableBytes = Get-MetricBytes -ResourceId $tableSvcId -MetricName 'TableCapacity' -MetricNamespace 'Microsoft.Storage/storageAccounts/tableServices' -Days 2
       if ($tableBytes -gt 0) {
@@ -561,7 +578,6 @@ function Collect-NetAppFiles {
           $vols = Get-AzNetAppFilesVolume -ResourceGroupName $rg.ResourceGroupName -AccountName $acct.Name -PoolName $pool.Name -ErrorAction SilentlyContinue
           foreach ($v in $vols) {
             $loc = Normalize-Location ($v.Location ?? $acct.Location)
-            # UsageThreshold is the provisioned quota (bytes)
             $bytes = [double]$v.UsageThreshold
             Add-ListItem -List $AllNetAppVolumes -Item ([pscustomobject]@{
               SubscriptionId=$SubId; ResourceGroup=(Anon-RG $rg.ResourceGroupName); Account=(Anon-Obj $acct.Name 'anfacct-');
