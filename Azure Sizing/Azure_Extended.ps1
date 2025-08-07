@@ -73,7 +73,7 @@ param (
   [switch]$AggregateStorageAtAccountLevel
 )
 
-$ScriptVersion = "3.4.2"
+$ScriptVersion = "3.4.3"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
 # Quiet deprecation spam from Get-AzMetric
@@ -721,6 +721,9 @@ $totalGiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes 
 $totalTiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1TB, 3)
 $byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
 
+# PowerShell 5.x compatibility: avoid ternary operator in the HTML
+$aggLevel = if ($AggregateStorageAtAccountLevel) { 'account' } else { 'service' }
+
 $byRegionApp = Import-Csv $byRegionFile
 $pivotRows = @()
 $regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
@@ -751,7 +754,7 @@ $report = @"
 <p>Generated: $(Get-Date)</p>
 <h2>Totals by App</h2>
 $byAppHtml
-<p class="note">Sizes shown in GiB/TiB (1024-based). Storage is aggregated at the <strong>$([bool]$AggregateStorageAtAccountLevel ? 'account' : 'service')</strong> level to avoid double counting.</p>
+<p class="note">Sizes shown in GiB/TiB (1024-based). Storage is aggregated at the <strong>$aggLevel</strong> level to avoid double counting.</p>
 <h2>Top Regions by Total Capacity</h2>
 $topRegionsHtml
 <h2>Capacity by Region & App (TiB)</h2>
