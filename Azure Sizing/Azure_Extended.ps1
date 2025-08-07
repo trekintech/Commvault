@@ -60,11 +60,11 @@ param (
   [string]$AnonymizeScope = 'None',
   [string]$AnonymizeSalt,
 
-  # NEW: control whether to prompt to install Az.Oracle if it’s missing
+  # Prompt to install Az.Oracle if missing (Y/N). For silent install use -AutoInstallModules.
   [switch]$PromptInstallOracle
 )
 
-$ScriptVersion = "3.2.0"
+$ScriptVersion = "3.2.1"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
 #----------------------------
@@ -94,9 +94,8 @@ function Test-RequiredModules {
   }
 }
 
-function Convert-Bytes {
-  param([double]$Bytes)
-  $GiB = [math]::Round($Bytes / 1GB, 2)      # 1024-based
+function Convert-Bytes { param([double]$Bytes)
+  $GiB = [math]::Round($Bytes / 1GB, 2)
   $TiB = [math]::Round($Bytes / 1TB, 3)
   [pscustomobject]@{ Bytes=$Bytes; GiB=$GiB; TiB=$TiB }
 }
@@ -276,6 +275,14 @@ function Collect-VMs-And-Disks {
   foreach ($d in $disks) {
     $loc = Normalize-Location $d.Location
     $sizeBytes = To-BytesFromGB $d.DiskSizeGB
+
+    # FIX: compute 'AttachedTo' first (avoid inline 'if' in hashtable)
+    $attached = 'Unattached'
+    if ($d.ManagedBy) {
+      $vmName = Split-Path $d.ManagedBy -Leaf
+      $attached = Anon-Obj $vmName 'vm-'
+    }
+
     Add-ListItem -List $AllManagedDisks -Item ([pscustomobject]@{
       SubscriptionId=$SubId
       ResourceGroup=(Anon-RG $d.ResourceGroupName)
@@ -283,7 +290,7 @@ function Collect-VMs-And-Disks {
       Location=$loc
       Sku=$d.Sku.Name
       DiskSizeGB=$d.DiskSizeGB
-      AttachedTo=(if ($d.ManagedBy) { Anon-Obj (Split-Path $d.ManagedBy -Leaf) 'vm-' } else { 'Unattached' })
+      AttachedTo=$attached
     })
     Add-Aggregate -Map $Aggregates -App 'Managed Disk' -Region $loc -SizeBytes $sizeBytes
   }
