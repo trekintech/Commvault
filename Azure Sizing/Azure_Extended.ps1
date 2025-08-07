@@ -73,7 +73,7 @@ param (
   [switch]$AggregateStorageAtAccountLevel
 )
 
-$ScriptVersion = "3.4.1"
+$ScriptVersion = "3.4.2"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
 # Quiet deprecation spam from Get-AzMetric
@@ -150,7 +150,7 @@ function Add-Aggregate {
 function New-List { New-Object System.Collections.ArrayList }
 function Add-ListItem { param([System.Collections.ArrayList]$List,[object]$Item) [void]$List.Add($Item) }
 
-# ===== CHANGED: Generic metrics helper with Aggregation/TimeGrain params (defaults keep old behaviour) =====
+# ===== metrics helper (supports agg/grain selection) =====
 function Get-MetricBytes {
   param(
     [Parameter(Mandatory)][string]$ResourceId,
@@ -196,7 +196,7 @@ function Get-MetricBytes {
   } catch { return 0.0 }
 }
 
-# ===== CHANGED: Files share usage with daily/MAX, proper namespace, and robust fallbacks =====
+# ===== Azure Files per-share usage with daily/MAX and robust fallbacks =====
 function Get-FileShareUsedBytes {
   param(
     [Parameter(Mandatory)][string]$StorageAccountId,
@@ -206,24 +206,24 @@ function Get-FileShareUsedBytes {
   $rid = "$StorageAccountId/fileServices/default"
   $ns  = 'Microsoft.Storage/storageAccounts/fileServices'
 
-  # 1) Most reliable: daily/MAX filtered by ShareName (exact case)
+  # 1) daily/MAX filtered by ShareName (exact case)
   $flt = "ShareName eq '$ShareName'"
   $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
            -AggregationType Maximum -TimeGrain ([TimeSpan]::Parse('1.00:00:00')) -Days 3 -Filter $flt
   if ($bytes -gt 0) { return $bytes }
 
-  # 2) Fallback: try lowercased dimension value (some tenants normalize dimension values)
+  # 2) try lowercased value
   $flt2 = "ShareName eq '$($ShareName.ToLower())'"
   $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
            -AggregationType Maximum -TimeGrain ([TimeSpan]::Parse('1.00:00:00')) -Days 3 -Filter $flt2
   if ($bytes -gt 0) { return $bytes }
 
-  # 3) Fallback: hourly/AVG (older accounts sometimes only emit hourly)
+  # 3) hourly/AVG fallback
   $bytes = Get-MetricBytes -ResourceId $rid -MetricName 'FileCapacity' -MetricNamespace $ns `
            -AggregationType Average -TimeGrain ([TimeSpan]::Parse('01:00:00')) -Days 2 -Filter $flt
   if ($bytes -gt 0) { return $bytes }
 
-  # 4) Data-plane stats (requires data-plane permission or key/SAS)
+  # 4) data-plane fallback
   try {
     if ($Context) {
       $sh = Get-AzStorageShare -Context $Context -Name $ShareName -ErrorAction SilentlyContinue
@@ -577,7 +577,12 @@ function Collect-NetAppFiles {
         foreach ($pool in $pools) {
           $vols = Get-AzNetAppFilesVolume -ResourceGroupName $rg.ResourceGroupName -AccountName $acct.Name -PoolName $pool.Name -ErrorAction SilentlyContinue
           foreach ($v in $vols) {
-            $loc = Normalize-Location ($v.Location ?? $acct.Location)
+            # PS 5/7 compatible coalesce of volume location -> account location
+            $volLoc = $v.Location
+            if ([string]::IsNullOrWhiteSpace($volLoc)) { $volLoc = $acct.Location }
+            $loc = Normalize-Location $volLoc
+
+            # UsageThreshold is provisioned quota (bytes)
             $bytes = [double]$v.UsageThreshold
             Add-ListItem -List $AllNetAppVolumes -Item ([pscustomobject]@{
               SubscriptionId=$SubId; ResourceGroup=(Anon-RG $rg.ResourceGroupName); Account=(Anon-Obj $acct.Name 'anfacct-');
@@ -716,13 +721,27 @@ $totalGiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes 
 $totalTiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1TB, 3)
 $byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
 
-$topRegions = $byRegionApp | Group-Object Region | ForEach-Object {
+$byRegionApp = Import-Csv $byRegionFile
+$pivotRows = @()
+$regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
+$apps    = $byRegionApp | Select-Object -ExpandProperty App    -Unique | Sort-Object
+foreach ($r in $regions) {
+  $row = [ordered]@{ Region = $r }
+  foreach ($a in $apps) {
+    $val = ($byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a } | Select-Object -ExpandProperty Size_TiB -ErrorAction SilentlyContinue)
+    if (-not $val) { $row[$a] = 0 } else { $row[$a] = [math]::Round(($val | Measure-Object -Sum).Sum, 3) }
+  }
+  $pivotRows += [pscustomobject]$row
+}
+$pivotHtml = $pivotRows | ConvertTo-Html -Fragment
+
+$topRegions = ($byRegionApp | Group-Object Region | ForEach-Object {
   [pscustomobject]@{
     Region = $_.Name
     Resources = ($_.Group | Measure-Object -Property Count -Sum).Sum
     TiB = [math]::Round(($_.Group | Measure-Object -Property Size_TiB -Sum).Sum, 3)
   }
-} | Sort-Object TiB -Descending | Select-Object -First 10
+} | Sort-Object TiB -Descending | Select-Object -First 10)
 $topRegionsHtml = $topRegions | ConvertTo-Html -Property Region,Resources,TiB -Fragment
 
 $report = @"
