@@ -750,7 +750,7 @@ $topRegionsHtml = $topRegions | ConvertTo-Html -Property Region,Resources,TiB -F
 $report = @"
 <html><head><meta charset="utf-8"><title>Azure Sizing Report</title>$css</head>
 <body>
-<h1>Azure Sizing Report <span class="badge">v$ScriptVersion</span></h1>
+<h1>Commvault Azure Sizing Report <span class="badge">v$ScriptVersion</span></h1>
 <p>Generated: $(Get-Date)</p>
 <h2>Totals by App</h2>
 $byAppHtml
@@ -775,4 +775,4 @@ Write-Host " - $byAppFile"
 Write-Host " - $byRegionFile"
 Write-Host " - $reportFile"
 Write-Host " - Raw CSVs for each service in $OutputPath"
-Write-Host "`n[DONE] Azure sizing complete." -ForegroundColor Green
+Write-Host "`n[DONE] Azure sizing complete - Share full outputs with Commvault." -ForegroundColor Green
