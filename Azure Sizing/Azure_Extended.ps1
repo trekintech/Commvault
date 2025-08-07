@@ -1,402 +1,563 @@
 #requires -Version 7.0
-#requires -Modules `
-    Az.Accounts, `
-    Az.Compute, `
-    Az.Storage, `
-    Az.Sql, `
-    Az.SqlVirtualMachine, `
-    Az.ResourceGraph, `
-    Az.Monitor, `
-    Az.Resources, `
-    Az.RecoveryServices, `
-    Az.CostManagement, `
-    Az.CosmosDB, `
-    Az.MySql, `
-    Az.MariaDb, `
-    Az.PostgreSql, `
-    Az.Table
+#requires -Modules Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql
 
 <#
 .SYNOPSIS
-Collects sizing and usage info across Azure workloads:
-  • VMs & Managed Disks
-  • SQL Databases & Managed Instances
-  • MySQL, MariaDB, PostgreSQL
-  • Cosmos DB
-  • Table Storage
-  • Blob & File Storage
-  • Recovery Services Vaults/Policies/Items/Cost
-  • (Optional) Key Vault counts
-  • Oracle Database@Azure
-Exports detailed CSVs and a summary CSV breaking down by Subscription, ResourceGroup, Region.
+Collects Azure workload inventory and capacity for backup sizing with regional breakdowns.
+
+.DESCRIPTION
+Get-AzureSizingInfo.ps1 discovers and sizes:
+- Azure VMs (count) and Managed Disks (capacity)
+- Azure SQL Databases and SQL Managed Instances
+- Azure Storage Accounts (total used), Blob Containers (optional detail), File Shares, Table Storage
+- Azure Data Lake Storage Gen2
+- Azure Cosmos DB (by account)
+- Azure Database for MySQL/MariaDB/PostgreSQL
+- Optional: Oracle Database@Azure
+- Optional: Azure Backup (vaults, policies, protected items)
+
+Outputs
+1) Per-workload totals (count + GiB + TiB)
+2) Per-region/per-workload breakdowns
+3) Raw detail CSVs for each service
+4) A lightweight HTML report for easy sharing
+
+This script is vendor-neutral and suitable to support Commvault sizing workflows.
+
+.EXAMPLE
+./Get-AzureSizingInfo.ps1 -CurrentSubscription -OutputPath .\out
+
+.EXAMPLE
+./Get-AzureSizingInfo.ps1 -AllSubscriptions -GetContainerDetails -AutoInstallModules
+
+.NOTES
+Avoids heavy blob enumeration by default. Uses Azure Metrics and Resource Graph where possible.
 #>
 
 param (
-  [Parameter(ParameterSetName='AllSubscriptions', Mandatory=$false)] [switch]$AllSubscriptions,
-  [Parameter(ParameterSetName='CurrentSubscription', Mandatory=$true)]  [switch]$CurrentSubscription,
-  [Parameter(ParameterSetName='Subscriptions', Mandatory=$true)]       [string]$Subscriptions = '',
-  [Parameter(ParameterSetName='SubscriptionIds', Mandatory=$true)]     [string]$SubscriptionIds = '',
-  [Parameter(ParameterSetName='ManagementGroups', Mandatory=$true)]    [string]$ManagementGroups,
-  [switch]$GetContainerDetails,
-  [switch]$GetKeyVaultAmounts,
-  [switch]$SkipAzureBackup,
-  [switch]$SkipAzureFiles,
-  [switch]$SkipAzureSQLandMI,
-  [switch]$SkipAzureStorageAccounts,
+  [CmdletBinding(DefaultParameterSetName = 'AllSubscriptions')]
+
+  [Parameter(ParameterSetName='AllSubscriptions')]
+  [switch]$AllSubscriptions,
+
+  [Parameter(ParameterSetName='CurrentSubscription', Mandatory=$true)]
+  [switch]$CurrentSubscription,
+
+  [Parameter(ParameterSetName='Subscriptions', Mandatory=$true)]
+  [string[]]$Subscriptions,
+
+  [Parameter(ParameterSetName='ManagementGroups', Mandatory=$true)]
+  [string[]]$ManagementGroups,
+
   [switch]$SkipAzureVMandManagedDisks,
+  [switch]$SkipAzureSQLandManagedInstances,
+  [switch]$SkipAzureStorageAccounts,
+  [switch]$SkipAzureBackup,
   [switch]$SkipAzureCosmosDB,
-  [switch]$Anonymize,
-  [string]$AnonymizeFields,
-  [string]$NotAnonymizeFields
+  [switch]$SkipAzureDataLake,
+  [switch]$SkipAzureDatabaseServices,
+  [switch]$SkipOracleDatabase,
+
+  [switch]$GetContainerDetails,
+  [string]$OutputPath = ".",
+
+  [switch]$AutoInstallModules
 )
 
-# -- preserve culture --
-$OriginalCulture = [Threading.Thread]::CurrentThread.CurrentCulture
-[Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
-[Threading.Thread]::CurrentThread.CurrentUICulture = 'en-US'
+$ScriptVersion = "3.0.0"
+Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
-# -- timestamp & logs --
-$date         = Get-Date
-$fileDate     = $date.ToString('yyyy-MM-dd_HHmm')
-$logFile      = "output_azure_$fileDate.log"
-if (Test-Path $logFile) { Remove-Item $logFile }
-Start-Transcript -Path $logFile
-
-# -- import modules --
-Import-Module `
-  Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,`
-  Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,`
-  Az.CostManagement,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql,Az.Table -ErrorAction Stop
-
-# -- determine subscriptions --
-$ctx   = Get-AzContext
-switch ($PSCmdlet.ParameterSetName) {
-  'AllSubscriptions'   { $subs = Get-AzSubscription -TenantId $ctx.Tenant.Id }
-  'CurrentSubscription'{ $subs = Get-AzSubscription -TenantId $ctx.Tenant.Id -SubscriptionName $ctx.Subscription.Name }
-  'Subscriptions'      { $subs = $Subscriptions.Split(',') | ForEach-Object { Get-AzSubscription -SubscriptionName $_ -TenantId $ctx.Tenant.Id } }
-  'SubscriptionIds'    { $subs = $SubscriptionIds.Split(',') | ForEach-Object { Get-AzSubscription -SubscriptionId $_ -TenantId $ctx.Tenant.Id } }
-  'ManagementGroups'   {
-    $subs = @()
-    foreach ($mg in $ManagementGroups.Split(',')) {
-      $ids = Search-AzGraph -Query "ResourceContainers | where type=='microsoft.resources/subscriptions' and managementGroupIds has '$mg'" 
-      $subs += ($ids | Select-Object -ExpandProperty name | ForEach-Object { Get-AzSubscription -SubscriptionId $_ -TenantId $ctx.Tenant.Id })
+#----------------------------
+# Helpers
+#----------------------------
+function Test-RequiredModules {
+  $required = @('Az.Accounts','Az.Compute','Az.Storage','Az.Sql','Az.SqlVirtualMachine','Az.ResourceGraph','Az.Monitor','Az.Resources')
+  $optional = @('Az.RecoveryServices','Az.CosmosDB','Az.MySql','Az.MariaDb','Az.PostgreSql','Az.Oracle')
+  $missingRequired = @()
+  foreach ($m in $required) { if (-not (Get-Module -ListAvailable -Name $m)) { $missingRequired += $m } }
+  if ($missingRequired.Count -gt 0) {
+    if ($AutoInstallModules) {
+      Write-Host "[INFO] Installing required modules: $($missingRequired -join ', ')" -ForegroundColor Yellow
+      $missingRequired | ForEach-Object { Install-Module -Name $_ -Scope CurrentUser -Force -AllowClobber }
+    } else {
+      Write-Host "[ERROR] Missing required modules: $($missingRequired -join ', ')" -ForegroundColor Red
+      Write-Host "Re-run with -AutoInstallModules or install them manually: Install-Module -Name $($missingRequired -join ', ')" -ForegroundColor Yellow
+      exit 1
     }
+  }
+  $optionalMissing = @()
+  foreach ($m in $optional) { if (-not (Get-Module -ListAvailable -Name $m)) { $optionalMissing += $m } }
+  if ($optionalMissing.Count -gt 0) {
+    Write-Host "[INFO] Optional modules not found (some features may be skipped): $($optionalMissing -join ', ')" -ForegroundColor Yellow
   }
 }
-
-# -- prepare collections --
-$vmList       = @()
-$attachedList = @(); $unattachedList = @()
-$sqlList      = @(); $miList = @()
-$mysqlList    = @(); $mariaList = @(); $pgList = @()
-$cosmosList   = @()
-$tableList    = @()
-$blobList     = @(); $fileList = @()
-$vaultList    = @(); $vaultPolicyList = @(); $vaultItemList = @(); $backupCostList = @()
-$kvList       = @()
-$oracleList   = @()
-
-# -- process each subscription --
-foreach ($sub in $subs) {
-  Set-AzContext -Subscription $sub.Id -Tenant $ctx.Tenant.Id | Out-Null
-  $tenant = (Get-AzTenant -TenantId $sub.TenantId).Name
-
-  #
-  # VMs & Managed Disks
-  #
-  if (-not $SkipAzureVMandManagedDisks) {
-    $vms = Get-AzVM -ErrorAction Continue
-    foreach ($vm in $vms) {
-      $disks      = $vm.StorageProfile.OSDisk, $vm.StorageProfile.DataDisks
-      $countDisk  = $disks.Count
-      $sizeGiB    = ($disks | Measure-Object -Property DiskSizeGB -Sum).Sum
-      $obj = [PSCustomObject]@{
-        Subscription    = $sub.Name
-        Tenant          = $tenant
-        ResourceGroup   = $vm.ResourceGroupName
-        Region          = $vm.Location
-        Name            = $vm.Name
-        VMSize          = $vm.HardwareProfile.VmSize
-        Status          = $vm.ProvisioningState
-        DiskCount       = $countDisk
-        DiskSizeGiB     = $sizeGiB
-        DiskSizeTiB     = [math]::Round($sizeGiB/1024,4)
-        HasMSSQL        = 'No'
-      }
-      # tags
-      foreach ($k in $vm.Tags.Keys) {
-        $obj | Add-Member -NotePropertyName "Tag_$k" -NotePropertyValue $vm.Tags[$k] -Force
-      }
-      $vmList += $obj
-    }
-    # mark SQL VMs
-    Get-AzSqlVM -ErrorAction Continue | ForEach-Object {
-      $match = $vmList | Where-Object { $_.Name -eq $_.Name -and $_.Subscription -eq $sub.Name }
-      if ($match) { $match.HasMSSQL = 'Yes'}
-    }
+function Convert-Bytes {
+  param([double]$Bytes)
+  $GiB = [math]::Round($Bytes / 1GB, 2)      # 1024-based GiB
+  $TiB = [math]::Round($Bytes / 1TB, 3)
+  [pscustomobject]@{ Bytes=$Bytes; GiB=$GiB; TiB=$TiB }
+}
+function To-BytesFromGB {
+  param([double]$GB)
+  # Treat numeric "GB" properties from Azure as GiB-aligned sizes for disks/quotas
+  return [double]$GB * 1GB
+}
+function Normalize-Location {
+  param([string]$Loc)
+  if (-not $Loc -or $Loc.Trim() -eq '') { return 'Unknown' }
+  $l = $Loc.Trim()
+  # Azure often returns lowercase region codes; keep as-is to avoid mislabeling
+  return $l
+}
+function Add-Aggregate {
+  param(
+    [hashtable]$Map,
+    [string]$App,
+    [string]$Region,
+    [double]$SizeBytes
+  )
+  $key = "$App|$Region"
+  if (-not $Map.ContainsKey($key)) {
+    $Map[$key] = [pscustomobject]@{ App=$App; Region=$Region; Count=0; Bytes=0.0 }
   }
-
-  #
-  # Azure SQL & Managed Instances
-  #
-  if (-not $SkipAzureSQLandMI) {
-    # standalone DBs + pools
-    foreach ($srv in Get-AzSqlServer -ErrorAction Continue) {
-      $dbs = Get-AzSqlDatabase -ServerName $srv.ServerName -ResourceGroupName $srv.ResourceGroupName -ErrorAction Continue
-      foreach ($db in $dbs) {
-        if ($db.SkuName -eq 'System') { continue }
-        $isPool = $db.SkuName -eq 'ElasticPool'
-        if ($isPool) { continue }  # elastic pools handled separately if desired
-        $obj = [PSCustomObject]@{
-          Subscription  = $sub.Name
-          Tenant        = $tenant
-          ResourceGroup = $srv.ResourceGroupName
-          Region        = $srv.Location
-          ResourceType  = 'AzureSQL'
-          Name          = $db.DatabaseName
-          Tier          = $db.SkuName
-          MaxSizeGiB    = [math]::Round($db.MaxSizeBytes/1GB,2)
-          MaxSizeTiB    = [math]::Round($db.MaxSizeBytes/1TB,4)
-        }
-        $sqlList += $obj
-      }
-    }
-    # managed instances
-    foreach ($mi in Get-AzSqlInstance -ErrorAction Continue) {
-      $obj = [PSCustomObject]@{
-        Subscription  = $sub.Name
-        Tenant        = $tenant
-        ResourceGroup = $mi.ResourceGroupName
-        Region        = $mi.Location
-        ResourceType  = 'SQLMI'
-        Name          = $mi.ManagedInstanceName
-        Tier          = $mi.Sku.Name
-        MaxSizeGiB    = $mi.StorageSizeInGB
-        MaxSizeTiB    = [math]::Round($mi.StorageSizeInGB/1024,4)
-      }
-      $miList += $obj
-    }
-  }
-
-  #
-  # MySQL, MariaDB, PostgreSQL
-  #
-  foreach ($srv in Get-AzMySqlServer -ErrorAction Continue) {
-    $obj = [PSCustomObject]@{
-      Subscription  = $sub.Name
-      Tenant        = $tenant
-      ResourceGroup = $srv.ResourceGroupName
-      Region        = $srv.Location
-      ResourceType  = 'MySQL'
-      Name          = $srv.Name
-      Tier          = $srv.Sku.Name
-      StorageGiB    = [math]::Round($srv.StorageProfile.StorageMB/1024,2)
-    }
-    $mysqlList += $obj
-  }
-  foreach ($srv in Get-AzMariaDbServer -ErrorAction Continue) {
-    $obj = [PSCustomObject]@{
-      Subscription  = $sub.Name
-      Tenant        = $tenant
-      ResourceGroup = $srv.ResourceGroupName
-      Region        = $srv.Location
-      ResourceType  = 'MariaDB'
-      Name          = $srv.Name
-      Tier          = $srv.Sku.Name
-      StorageGiB    = [math]::Round($srv.StorageProfile.StorageMB/1024,2)
-    }
-    $mariaList += $obj
-  }
-  foreach ($srv in Get-AzPostgreSqlServer -ErrorAction Continue) {
-    $obj = [PSCustomObject]@{
-      Subscription  = $sub.Name
-      Tenant        = $tenant
-      ResourceGroup = $srv.ResourceGroupName
-      Region        = $srv.Location
-      ResourceType  = 'PostgreSQL'
-      Name          = $srv.Name
-      Tier          = $srv.Sku.Name
-      StorageGiB    = [math]::Round($srv.StorageProfile.StorageMB/1024,2)
-    }
-    $pgList += $obj
-  }
-
-  #
-  # Table Storage
-  #
+  $Map[$key].Count++
+  $Map[$key].Bytes += $SizeBytes
+}
+function Get-ResourcesViaGraph {
+  param([string]$ResourceType,[string]$SubscriptionId)
+  $q = "Resources | where type =~ '$ResourceType' and subscriptionId == '$SubscriptionId'"
+  try { Search-AzGraph -Query $q -ErrorAction SilentlyContinue } catch { @() }
+}
+function Get-MetricBytes {
+  param([string]$ResourceId,[string]$MetricName,[int]$Days=1)
   try {
-    $sas = Get-AzStorageAccount -ErrorAction Continue | Where-Object Kind -in 'StorageV2','Table'
-    foreach ($sa in $sas) {
-      $ctx   = $sa.Context
-      $tabs  = Get-AzTable –Context $ctx -ErrorAction Continue
-      foreach ($t in $tabs) {
-        $obj = [PSCustomObject]@{
-          Subscription  = $sub.Name
-          Tenant        = $tenant
-          ResourceGroup = $sa.ResourceGroupName
-          Region        = $sa.PrimaryLocation
-          ResourceType  = 'TableStorage'
-          Account       = $sa.StorageAccountName
-          TableName     = $t.Name
+    $end = Get-Date
+    $start = $end.AddDays(-[math]::Max(1,$Days))
+    $m = Get-AzMetric -ResourceId $ResourceId -MetricName $MetricName -StartTime $start -EndTime $end -TimeGrain 01:00:00 -AggregationType Average -ErrorAction SilentlyContinue
+    $val = $m.Data | Where-Object { $_.Average -ne $null } | Select-Object -Last 1
+    if ($val) { return [double]$val.Average } else { return 0.0 }
+  } catch { return 0.0 }
+}
+
+#----------------------------
+# Init
+#----------------------------
+Test-RequiredModules
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$AllVMs = @()
+$AllManagedDisks = @()
+$AllSQLDatabases = @()
+$AllSQLManagedInstances = @()
+$AllStorageAccounts = @()
+$AllBlobContainers = @()
+$AllFileShares = @()
+$AllCosmosDBAccounts = @()
+$AllDataLakeGen2 = @()
+$AllMariaDBServers = @()
+$AllMySQLServers = @()
+$AllPostgreSQLServers = @()
+$AllTableStorage = @()
+$AllOracleDBs = @()
+$AllBackupVaults = @()
+$AllBackupPolicies = @()
+$AllBackupItems = @()
+
+$Aggregates = @{}        # key: "App|Region" -> {App,Region,Count,Bytes}
+$TotalsByApp = @{}       # key: "App" -> {App,Count,Bytes}
+
+function Bump-AppTotals {
+  param([string]$App,[int]$Count,[double]$Bytes)
+  if (-not $TotalsByApp.ContainsKey($App)) {
+    $TotalsByApp[$App] = [pscustomobject]@{ App=$App; Count=0; Bytes=0.0 }
+  }
+  $TotalsByApp[$App].Count += $Count
+  $TotalsByApp[$App].Bytes += $Bytes
+}
+
+#----------------------------
+# Target subscriptions
+#----------------------------
+Write-Host "[INFO] Checking Azure connection..." -ForegroundColor Green
+$ctx = Get-AzContext
+if (-not $ctx) { Write-Host "Not connected. Run Connect-AzAccount." -ForegroundColor Red; exit 1 }
+Write-Host "[INFO] Connected as: $($ctx.Account.Id)" -ForegroundColor Green
+
+function Get-TargetSubscriptions {
+  $target = @()
+  if ($CurrentSubscription) {
+    $c = Get-AzContext
+    $target += Get-AzSubscription -SubscriptionId $c.Subscription.Id
+  } elseif ($Subscriptions) {
+    foreach ($s in $Subscriptions) {
+      $sub = (Get-AzSubscription -SubscriptionName $s -ErrorAction SilentlyContinue)
+      if (-not $sub) { $sub = Get-AzSubscription -SubscriptionId $s -ErrorAction SilentlyContinue }
+      if ($sub) { $target += $sub }
+    }
+  } elseif ($ManagementGroups) {
+    foreach ($mg in $ManagementGroups) {
+      $mgSubs = Get-AzManagementGroupSubscription -GroupName $mg
+      foreach ($m in $mgSubs) { $target += Get-AzSubscription -SubscriptionId $m.Name }
+    }
+  } else {
+    $target = Get-AzSubscription
+  }
+  $target
+}
+
+$targetSubscriptions = Get-TargetSubscriptions
+Write-Host "[INFO] Subscriptions to process: $($targetSubscriptions.Count)" -ForegroundColor Green
+
+#----------------------------
+# Collectors
+#----------------------------
+function Collect-VMs-And-Disks {
+  param($SubId)
+  Write-Host "  [VM/Disks] $SubId" -ForegroundColor Cyan
+  $vms = Get-AzVM -Status -ErrorAction SilentlyContinue
+  foreach ($vm in $vms) {
+    $loc = Normalize-Location $vm.Location
+    $AllVMs += [pscustomobject]@{
+      SubscriptionId=$SubId; ResourceGroup=$vm.ResourceGroupName; Name=$vm.Name; Location=$loc; VmSize=$vm.HardwareProfile.VmSize
+    }
+    Add-Aggregate -Map $Aggregates -App 'Azure VM' -Region $loc -SizeBytes 0
+  }
+  $disks = Get-AzDisk -ErrorAction SilentlyContinue
+  foreach ($d in $disks) {
+    $loc = Normalize-Location $d.Location
+    $sizeBytes = To-BytesFromGB $d.DiskSizeGB
+    $AllManagedDisks += [pscustomobject]@{
+      SubscriptionId=$SubId; ResourceGroup=$d.ResourceGroupName; Name=$d.Name; Location=$loc; Sku=$d.Sku.Name; DiskSizeGB=$d.DiskSizeGB
+    }
+    Add-Aggregate -Map $Aggregates -App 'Managed Disk' -Region $loc -SizeBytes $sizeBytes
+  }
+}
+
+function Collect-SQL {
+  param($SubId)
+  Write-Host "  [SQL] $SubId" -ForegroundColor Cyan
+  $servers = Get-AzSqlServer -ErrorAction SilentlyContinue
+  foreach ($s in $servers) {
+    $dbs = Get-AzSqlDatabase -ServerName $s.ServerName -ResourceGroupName $s.ResourceGroupName -ErrorAction SilentlyContinue
+    foreach ($db in $dbs) {
+      if ($db.DatabaseName -eq 'master') { continue }
+      $loc = Normalize-Location $db.Location
+      $sizeBytes = [double]($db.MaxSizeBytes)
+      $AllSQLDatabases += [pscustomobject]@{
+        SubscriptionId=$SubId; ResourceGroup=$db.ResourceGroupName; ServerName=$s.ServerName; DatabaseName=$db.DatabaseName; Location=$loc; MaxSizeBytes=$db.MaxSizeBytes
+      }
+      Add-Aggregate -Map $Aggregates -App 'Azure SQL DB' -Region $loc -SizeBytes $sizeBytes
+    }
+  }
+  $mis = Get-AzSqlInstance -ErrorAction SilentlyContinue
+  foreach ($mi in $mis) {
+    $loc = Normalize-Location $mi.Location
+    $sizeBytes = To-BytesFromGB ($mi.StorageSizeInGB)
+    $AllSQLManagedInstances += [pscustomobject]@{
+      SubscriptionId=$SubId; ResourceGroup=$mi.ResourceGroupName; Name=$mi.ManagedInstanceName; Location=$loc; StorageSizeInGB=$mi.StorageSizeInGB
+    }
+    Add-Aggregate -Map $Aggregates -App 'SQL Managed Instance' -Region $loc -SizeBytes $sizeBytes
+  }
+}
+
+function Collect-Storage {
+  param($SubId)
+  Write-Host "  [Storage] $SubId" -ForegroundColor Cyan
+  $sas = Get-AzStorageAccount -ErrorAction SilentlyContinue
+  foreach ($sa in $sas) {
+    $loc = Normalize-Location $sa.Location
+    $acctBytes = Get-MetricBytes -ResourceId $sa.Id -MetricName 'UsedCapacity' -Days 2
+    $AllStorageAccounts += [pscustomobject]@{
+      SubscriptionId=$SubId; ResourceGroup=$sa.ResourceGroupName; StorageAccountName=$sa.StorageAccountName; Location=$loc; Kind=$sa.Kind; Sku=$sa.Sku.Name; UsedBytes=$acctBytes
+    }
+    Add-Aggregate -Map $Aggregates -App 'Storage Account' -Region $loc -SizeBytes $acctBytes
+
+    if ($sa.EnableHierarchicalNamespace) {
+      $AllDataLakeGen2 += [pscustomobject]@{
+        SubscriptionId=$SubId; ResourceGroup=$sa.ResourceGroupName; StorageAccountName=$sa.StorageAccountName; Location=$loc; UsedBytes=$acctBytes
+      }
+      Add-Aggregate -Map $Aggregates -App 'ADLS Gen2' -Region $loc -SizeBytes $acctBytes
+    }
+
+    try {
+      $ctx = $sa.Context
+      # File shares
+      $shares = Get-AzStorageShare -Context $ctx -ErrorAction SilentlyContinue
+      foreach ($sh in $shares) {
+        $usageBytes = 0.0
+        try {
+          $stats = Get-AzStorageShareStats -Share $sh -Context $ctx -ErrorAction SilentlyContinue
+          if ($stats -and $stats.Usage) { $usageBytes = [double]$stats.Usage }
+        } catch {}
+        $AllFileShares += [pscustomobject]@{
+          SubscriptionId=$SubId; ResourceGroup=$sa.ResourceGroupName; StorageAccountName=$sa.StorageAccountName; ShareName=$sh.Name; Location=$loc; UsedBytes=$usageBytes
         }
-        $tableList += $obj
+        Add-Aggregate -Map $Aggregates -App 'Azure Files' -Region $loc -SizeBytes $usageBytes
       }
-    }
-  } catch { Write-Host "TableStorage error: $_" -ForegroundColor Yellow }
 
-  #
-  # Cosmos DB
-  #
-  if (-not $SkipAzureCosmosDB) {
-    foreach ($acc in Get-AzCosmosDBAccount -ErrorAction Continue) {
-      $obj = [PSCustomObject]@{
-        Subscription  = $sub.Name
-        Tenant        = $tenant
-        ResourceGroup = $acc.ResourceGroupName
-        Region        = $acc.Location
-        ResourceType  = 'CosmosDB'
-        Name          = $acc.Name
-        Kind          = $acc.Kind
-        OfferType     = $acc.NameDatabaseAccountOfferType
+      # Tables (service-level metric approximation)
+      $tableSvcId = "$($sa.Id)/tableServices/default"
+      $tableBytes = Get-MetricBytes -ResourceId $tableSvcId -MetricName 'TableCapacity' -Days 2
+      if ($tableBytes -gt 0) {
+        $AllTableStorage += [pscustomobject]@{
+          SubscriptionId=$SubId; ResourceGroup=$sa.ResourceGroupName; StorageAccountName=$sa.StorageAccountName; Location=$loc; UsedBytes=$tableBytes
+        }
+        Add-Aggregate -Map $Aggregates -App 'Table Storage' -Region $loc -SizeBytes $tableBytes
       }
-      $cosmosList += $obj
-    }
-  }
 
-  #
-  # Blob & File Storage (metrics)
-  #
-  if (-not $SkipAzureStorageAccounts) {
-    $sas = Get-AzStorageAccount -ErrorAction Continue
-    foreach ($sa in $sas) {
-      $resId = $sa.Id
-      # Blob
-      $mb = (Get-AzMetric -ResourceId "$resId/blobServices/default" -MetricName BlobCapacity -Aggregation Maximum -ErrorAction SilentlyContinue).Data.Maximum[-1]
-      $objB = [PSCustomObject]@{
-        Subscription  = $sub.Name; Tenant=$tenant; ResourceGroup=$sa.ResourceGroupName; Region=$sa.PrimaryLocation;
-        ResourceType='BlobStorage'; Account=$sa.StorageAccountName; UsedGiB=[math]::Round($mb/1GB,2)
-      }
-      $blobList += $objB
-      # File
-      $mf = (Get-AzMetric -ResourceId "$resId/fileServices/default" -MetricName FileCapacity -Aggregation Maximum -ErrorAction SilentlyContinue).Data.Maximum[-1]
-      $objF = [PSCustomObject]@{
-        Subscription  = $sub.Name; Tenant=$tenant; ResourceGroup=$sa.ResourceGroupName; Region=$sa.PrimaryLocation;
-        ResourceType='FileStorage'; Account=$sa.StorageAccountName; UsedGiB=[math]::Round($mf/1GB,2)
-      }
-      $fileList += $objF
-    }
-  }
-
-  #
-  # Recovery Services Vaults & Backup
-  #
-  if (-not $SkipAzureBackup) {
-    foreach ($vault in Get-AzRecoveryServicesVault -ErrorAction Continue) {
-      $vp = Get-AzRecoveryServicesBackupProtectionPolicy -Vault $vault -ErrorAction Continue
-      $vi = $vp | ForEach-Object { Get-AzRecoveryServicesBackupItem -Policy $_ -ErrorAction SilentlyContinue }
-      $cost = (Invoke-AzCostManagementQuery -Type Usage -Scope "subscriptions/$($sub.SubscriptionId)" `
-                 -DatasetGranularity Monthly -Timeframe MonthToDate `
-                 -DatasetFilter (New-AzCostManagementQueryFilterObject -Dimensions (New-AzCostManagementQueryComparisonExpressionObject -Name 'ServiceName' -Value 'Backup')) `
-                 -DatasetAggregation @{ totalCostUSD = @{ name='CostUSD'; function='Sum' } } `
-                 -ErrorAction SilentlyContinue).Rows | ForEach-Object {
-                   [PSCustomObject]@{
-                     Subscription=$sub.Name; Tenant=$tenant; Month=$_[-1]; CostUSD=[math]::Round($_[0],2)
-                   }
-                 }
-
-      $vaultList      += [PSCustomObject]@{ Subscription=$sub.Name; Tenant=$tenant; ResourceGroup=$vault.ResourceGroupName; Region=$vault.Location; Name=$vault.Name }
-      $vaultPolicyList+= $vp
-      $vaultItemList  += $vi
-      $backupCostList += $cost
-    }
-  }
-
-  #
-  # Key Vault counts
-  #
-  if ($GetKeyVaultAmounts) {
-    foreach ($kv in Get-AzKeyVault -ErrorAction Continue) {
-      $certs = (Get-AzKeyVaultCertificate -VaultName $kv.VaultName -ErrorAction SilentlyContinue).Count
-      $secrs = (Get-AzKeyVaultSecret -VaultName $kv.VaultName -ErrorAction SilentlyContinue).Count
-      $keys  = (Get-AzKeyVaultKey -VaultName $kv.VaultName -ErrorAction SilentlyContinue).Count
-      $kvList += [PSCustomObject]@{
-        Subscription=$sub.Name; Tenant=$tenant; ResourceGroup=$kv.ResourceGroupName; Region=$kv.Location; Name=$kv.VaultName;
-        CertCount=$certs; SecretCount=$secrs; KeyCount=$keys
-      }
-    }
-  }
-
-  #
-  # Oracle Database@Azure via Resource Graph
-  #
-  try {
-    $ords = Search-AzGraph -Query "Resources | where type=='Microsoft.Oracle/servers'"
-    foreach ($o in $ords) {
-      $oracleList += [PSCustomObject]@{
-        Subscription  = $sub.Name; Tenant=$tenant; ResourceGroup=$o.resourceGroup; Region=$o.location;
-        ResourceType='Oracle@Azure'; Name=$o.name; SKU=$o.sku.name
-      }
-    }
-  } catch { Write-Host "Oracle@Azure error: $_" -ForegroundColor Yellow }
-
-} # end foreach subscription
-
-# -- Export CSVs --
-$outputDir = "."
-$lists = @{
-  azure_vms               = $vmList
-  azure_sql               = $sqlList
-  azure_sqlmi             = $miList
-  azure_mysql             = $mysqlList
-  azure_mariadb           = $mariaList
-  azure_postgresql        = $pgList
-  azure_cosmosdb          = $cosmosList
-  azure_tablestorage      = $tableList
-  azure_blobstorage       = $blobList
-  azure_filestorage       = $fileList
-  azure_backup_vaults     = $vaultList
-  azure_backup_policies   = $vaultPolicyList
-  azure_backup_items      = $vaultItemList
-  azure_backup_costs      = $backupCostList
-  azure_keyvaults         = $kvList
-  azure_oracle            = $oracleList
-}
-
-foreach ($name in $lists.Keys) {
-  $data = $lists[$name]
-  if ($data -and $data.Count -gt 0) {
-    $path = Join-Path $outputDir "${name}_$fileDate.csv"
-    $data | Export-Csv -Path $path -NoTypeInformation
-    Write-Host "Exported $path"
-  }
-}
-
-#
-# Create a combined summary that breaks down by Subscription / ResourceGroup / Region / ResourceType
-#
-$summary = @()
-foreach ($name in $lists.Keys) {
-  $data = $lists[$name]
-  if ($data -and $data.Count -gt 0) {
-    $grouped = $data |
-      Group-Object Subscription,ResourceGroup,Region |
-      ForEach-Object {
-        [PSCustomObject]@{
-          Subscription   = $_.Name.Subscription
-          ResourceGroup  = $_.Name.ResourceGroup
-          Region         = $_.Name.Region
-          ResourceType   = $name
-          Count          = $_.Count
+      # Blobs per-container (heavy) only when requested
+      if ($GetContainerDetails) {
+        $containers = Get-AzStorageContainer -Context $ctx -ErrorAction SilentlyContinue
+        foreach ($c in $containers) {
+          # Best-effort estimate by enumerating names/lengths; can be slow on large accounts
+          $sumBytes = 0.0
+          try {
+            $blobs = Get-AzStorageBlob -Container $c.Name -Context $ctx -ErrorAction SilentlyContinue
+            if ($blobs) { $sumBytes = ($blobs | Measure-Object -Property Length -Sum).Sum }
+          } catch {}
+          $AllBlobContainers += [pscustomobject]@{
+            SubscriptionId=$SubId; ResourceGroup=$sa.ResourceGroupName; StorageAccountName=$sa.StorageAccountName; ContainerName=$c.Name; Location=$loc; UsedBytes=$sumBytes
+          }
+          Add-Aggregate -Map $Aggregates -App 'Blob Container' -Region $loc -SizeBytes $sumBytes
         }
       }
-    $summary += $grouped
+    } catch {
+      Write-Host "    [WARN] Could not access storage context for $($sa.StorageAccountName)" -ForegroundColor Yellow
+    }
   }
 }
-$summaryPath = Join-Path $outputDir "azure_sizing_summary_$fileDate.csv"
-$summary | Export-Csv -Path $summaryPath -NoTypeInformation
-Write-Host "Exported summary to $summaryPath"
 
-Stop-Transcript
-# -- restore culture --
-[Threading.Thread]::CurrentThread.CurrentCulture = $OriginalCulture
-[Threading.Thread]::CurrentThread.CurrentUICulture = $OriginalCulture
+function Collect-Cosmos {
+  param($SubId)
+  Write-Host "  [Cosmos DB] $SubId" -ForegroundColor Cyan
+  # Discover via Resource Graph, size via metrics (DataUsage + IndexUsage)
+  $cosmos = Get-ResourcesViaGraph -ResourceType "microsoft.documentdb/databaseaccounts" -SubscriptionId $SubId
+  foreach ($c in $cosmos) {
+    $loc = Normalize-Location $c.location
+    $rid = "/subscriptions/$SubId/resourceGroups/$($c.resourceGroup)/providers/Microsoft.DocumentDB/databaseAccounts/$($c.name)"
+    $data = Get-MetricBytes -ResourceId $rid -MetricName 'DataUsage' -Days 2
+    $index = Get-MetricBytes -ResourceId $rid -MetricName 'IndexUsage' -Days 2
+    $used = $data + $index
+    $AllCosmosDBAccounts += [pscustomobject]@{
+      SubscriptionId=$SubId; ResourceGroup=$c.resourceGroup; AccountName=$c.name; Location=$loc; UsedBytes=$used
+    }
+    Add-Aggregate -Map $Aggregates -App 'Cosmos DB' -Region $loc -SizeBytes $used
+  }
+}
+
+function Collect-PaaS-DBs {
+  param($SubId)
+  Write-Host "  [MySQL/MariaDB/PostgreSQL] $SubId" -ForegroundColor Cyan
+  $rgs = Get-AzResourceGroup -ErrorAction SilentlyContinue
+  foreach ($rg in $rgs) {
+    try {
+      $maria = Get-AzMariaDbServer -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+      foreach ($s in $maria) {
+        $loc = Normalize-Location $s.Location
+        $bytes = [double]$s.StorageProfile.StorageMB * 1MB
+        $AllMariaDBServers += [pscustomobject]@{ SubscriptionId=$SubId; ResourceGroup=$s.ResourceGroupName; ServerName=$s.Name; Location=$loc; UsedBytes=$bytes }
+        Add-Aggregate -Map $Aggregates -App 'MariaDB' -Region $loc -SizeBytes $bytes
+      }
+    } catch {}
+    try {
+      $mysql = Get-AzMySqlServer -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+      foreach ($s in $mysql) {
+        $loc = Normalize-Location $s.Location
+        $bytes = [double]$s.StorageProfile.StorageMB * 1MB
+        $AllMySQLServers += [pscustomobject]@{ SubscriptionId=$SubId; ResourceGroup=$s.ResourceGroupName; ServerName=$s.Name; Location=$loc; UsedBytes=$bytes }
+        Add-Aggregate -Map $Aggregates -App 'MySQL' -Region $loc -SizeBytes $bytes
+      }
+    } catch {}
+    try {
+      $pg = Get-AzPostgreSqlServer -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+      foreach ($s in $pg) {
+        $loc = Normalize-Location $s.Location
+        $bytes = [double]$s.StorageProfile.StorageMB * 1MB
+        $AllPostgreSQLServers += [pscustomobject]@{ SubscriptionId=$SubId; ResourceGroup=$s.ResourceGroupName; ServerName=$s.Name; Location=$loc; UsedBytes=$bytes }
+        Add-Aggregate -Map $Aggregates -App 'PostgreSQL' -Region $loc -SizeBytes $bytes
+      }
+    } catch {}
+  }
+}
+
+function Collect-Oracle {
+  param($SubId)
+  if ($SkipOracleDatabase) { return }
+  if (-not (Get-Module -ListAvailable -Name Az.Oracle)) {
+    Write-Host "  [Oracle] Az.Oracle not installed; skipping." -ForegroundColor Yellow
+    return
+  }
+  Write-Host "  [Oracle] $SubId" -ForegroundColor Cyan
+  Import-Module Az.Oracle -ErrorAction SilentlyContinue
+  $rgs = Get-AzResourceGroup -ErrorAction SilentlyContinue
+  foreach ($rg in $rgs) {
+    try {
+      $adbs = Get-AzOracleAutonomousDatabase -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+      foreach ($db in $adbs) {
+        $loc = Normalize-Location $db.Location
+        $bytes = ([double]$db.DataStorageSizeInTBs) * 1TB
+        $AllOracleDBs += [pscustomobject]@{ SubscriptionId=$SubId; ResourceGroup=$rg.ResourceGroupName; Name=$db.Name; Location=$loc; UsedBytes=$bytes }
+        Add-Aggregate -Map $Aggregates -App 'Oracle@Azure' -Region $loc -SizeBytes $bytes
+      }
+    } catch {}
+  }
+}
+
+function Collect-Backup {
+  param($SubId)
+  if ($SkipAzureBackup) { return }
+  Write-Host "  [Azure Backup] $SubId" -ForegroundColor Cyan
+  $vaults = Get-AzRecoveryServicesVault -ErrorAction SilentlyContinue
+  foreach ($v in $vaults) {
+    $loc = Normalize-Location $v.Location
+    $AllBackupVaults += [pscustomobject]@{ SubscriptionId=$SubId; ResourceGroup=$v.ResourceGroupName; VaultName=$v.Name; Location=$loc }
+    try {
+      Set-AzRecoveryServicesVaultContext -Vault $v -ErrorAction SilentlyContinue
+      $pol = Get-AzRecoveryServicesBackupProtectionPolicy -ErrorAction SilentlyContinue
+      foreach ($p in $pol) {
+        $AllBackupPolicies += [pscustomobject]@{ SubscriptionId=$SubId; VaultName=$v.Name; PolicyName=$p.Name; WorkloadType=$p.WorkloadType; BackupManagementType=$p.BackupManagementType }
+      }
+      $containers = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -ErrorAction SilentlyContinue
+      foreach ($c in $containers) {
+        $items = Get-AzRecoveryServicesBackupItem -Container $c -WorkloadType AzureVM -ErrorAction SilentlyContinue
+        foreach ($i in $items) {
+          $AllBackupItems += [pscustomobject]@{
+            SubscriptionId=$SubId; VaultName=$v.Name; ItemName=$i.Name; ProtectionState=$i.ProtectionState; LastBackupTime=$i.LastBackupTime
+          }
+        }
+      }
+    } catch {}
+  }
+}
+
+#----------------------------
+# Execute per subscription
+#----------------------------
+foreach ($sub in $targetSubscriptions) {
+  Write-Host "`n[INFO] Processing: $($sub.Name) ($($sub.Id))" -ForegroundColor Yellow
+  Set-AzContext -SubscriptionId $sub.Id | Out-Null
+
+  if (-not $SkipAzureVMandManagedDisks) { Collect-VMs-And-Disks -SubId $sub.Id }
+  if (-not $SkipAzureSQLandManagedInstances) { Collect-SQL -SubId $sub.Id }
+  if (-not $SkipAzureStorageAccounts) { Collect-Storage -SubId $sub.Id }
+  if (-not $SkipAzureCosmosDB) { Collect-Cosmos -SubId $sub.Id }
+  if (-not $SkipAzureDatabaseServices) { Collect-PaaS-DBs -SubId $sub.Id }
+  if (-not $SkipOracleDatabase) { Collect-Oracle -SubId $sub.Id }
+  if (-not $SkipAzureBackup) { Collect-Backup -SubId $sub.Id }
+}
+
+#----------------------------
+# Build summaries
+#----------------------------
+# Roll Aggregates into TotalsByApp
+foreach ($kv in $Aggregates.GetEnumerator()) {
+  $rec = $kv.Value
+  Bump-AppTotals -App $rec.App -Count $rec.Count -Bytes $rec.Bytes
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not (Test-Path $OutputPath)) { New-Item -Path $OutputPath -ItemType Directory | Out-Null }
+
+# Per-app totals CSV
+$byApp = $TotalsByApp.Values | Sort-Object App | ForEach-Object {
+  $conv = Convert-Bytes $_.Bytes
+  [pscustomobject]@{
+    App       = $_.App
+    Count     = $_.Count
+    Size_GiB  = $conv.GiB
+    Size_TiB  = $conv.TiB
+  }
+}
+$byAppFile = Join-Path $OutputPath "azure_sizing_by_app_$timestamp.csv"
+$byApp | Export-Csv -Path $byAppFile -NoTypeInformation
+
+# Per-region per-app CSV
+$byRegionApp = $Aggregates.Values | Sort-Object Region,App | ForEach-Object {
+  $conv = Convert-Bytes $_.Bytes
+  [pscustomobject]@{
+    Region    = $_.Region
+    App       = $_.App
+    Count     = $_.Count
+    Size_GiB  = $conv.GiB
+    Size_TiB  = $conv.TiB
+  }
+}
+$byRegionFile = Join-Path $OutputPath "azure_sizing_by_region_$timestamp.csv"
+$byRegionApp | Export-Csv -Path $byRegionFile -NoTypeInformation
+
+# Also export raw detail CSVs (for traceability)
+if ($AllVMs.Count)                { $AllVMs                | Export-Csv (Join-Path $OutputPath "azure_vms_$timestamp.csv") -NoTypeInformation }
+if ($AllManagedDisks.Count)       { $AllManagedDisks       | Export-Csv (Join-Path $OutputPath "azure_managed_disks_$timestamp.csv") -NoTypeInformation }
+if ($AllSQLDatabases.Count)       { $AllSQLDatabases       | Export-Csv (Join-Path $OutputPath "azure_sql_databases_$timestamp.csv") -NoTypeInformation }
+if ($AllSQLManagedInstances.Count){ $AllSQLManagedInstances| Export-Csv (Join-Path $OutputPath "azure_sql_managed_instances_$timestamp.csv") -NoTypeInformation }
+if ($AllStorageAccounts.Count)    { $AllStorageAccounts    | Export-Csv (Join-Path $OutputPath "azure_storage_accounts_$timestamp.csv") -NoTypeInformation }
+if ($AllBlobContainers.Count)     { $AllBlobContainers     | Export-Csv (Join-Path $OutputPath "azure_blob_containers_$timestamp.csv") -NoTypeInformation }
+if ($AllFileShares.Count)         { $AllFileShares         | Export-Csv (Join-Path $OutputPath "azure_file_shares_$timestamp.csv") -NoTypeInformation }
+if ($AllCosmosDBAccounts.Count)   { $AllCosmosDBAccounts   | Export-Csv (Join-Path $OutputPath "azure_cosmosdb_accounts_$timestamp.csv") -NoTypeInformation }
+if ($AllDataLakeGen2.Count)       { $AllDataLakeGen2       | Export-Csv (Join-Path $OutputPath "azure_datalake_gen2_$timestamp.csv") -NoTypeInformation }
+if ($AllMariaDBServers.Count)     { $AllMariaDBServers     | Export-Csv (Join-Path $OutputPath "azure_mariadb_servers_$timestamp.csv") -NoTypeInformation }
+if ($AllMySQLServers.Count)       { $AllMySQLServers       | Export-Csv (Join-Path $OutputPath "azure_mysql_servers_$timestamp.csv") -NoTypeInformation }
+if ($AllPostgreSQLServers.Count)  { $AllPostgreSQLServers  | Export-Csv (Join-Path $OutputPath "azure_postgresql_servers_$timestamp.csv") -NoTypeInformation }
+if ($AllTableStorage.Count)       { $AllTableStorage       | Export-Csv (Join-Path $OutputPath "azure_table_storage_$timestamp.csv") -NoTypeInformation }
+if ($AllOracleDBs.Count)          { $AllOracleDBs          | Export-Csv (Join-Path $OutputPath "azure_oracle_databases_$timestamp.csv") -NoTypeInformation }
+if ($AllBackupVaults.Count)       { $AllBackupVaults       | Export-Csv (Join-Path $OutputPath "azure_backup_vaults_$timestamp.csv") -NoTypeInformation }
+if ($AllBackupPolicies.Count)     { $AllBackupPolicies     | Export-Csv (Join-Path $OutputPath "azure_backup_policies_$timestamp.csv") -NoTypeInformation }
+if ($AllBackupItems.Count)        { $AllBackupItems        | Export-Csv (Join-Path $OutputPath "azure_backup_items_$timestamp.csv") -NoTypeInformation }
+
+# HTML Summary (nice, portable)
+$css = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin:20px; }
+h1 { color:#0b6aa2; }
+h2 { color:#0b6aa2; margin-top:30px; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0 30px 0; }
+th, td { border: 1px solid #ddd; padding: 8px; }
+th { background: #e6f2f9; text-align: left; }
+tr:nth-child(even) { background: #fafafa; }
+.badge { display:inline-block; padding:4px 8px; background:#0b6aa2; color:#fff; border-radius:4px; font-size:12px; }
+.note { color:#666; font-size:12px; }
+</style>
+"@
+
+$totalGiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1GB, 2)
+$totalTiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1TB, 3)
+
+$byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
+$topRegions = $byRegionApp | Group-Object Region | ForEach-Object {
+  [pscustomobject]@{
+    Region = $_.Name
+    Resources = ($_.Group | Measure-Object -Property Count -Sum).Sum
+    TiB = [math]::Round(($_.Group | Measure-Object -Property Size_TiB -Sum).Sum, 3)
+  }
+} | Sort-Object TiB -Descending | Select-Object -First 10
+$topRegionsHtml = $topRegions | ConvertTo-Html -Property Region,Resources,TiB -Fragment
+
+$report = @"
+<html><head><meta charset="utf-8"><title>Azure Sizing Report</title>$css</head>
+<body>
+<h1>Azure Sizing Report <span class="badge">v$ScriptVersion</span></h1>
+<p>Generated: $(Get-Date)</p>
+<h2>Totals by App</h2>
+$byAppHtml
+<p class="note">Sizes shown in GiB/TiB (1024-based). Counts reflect discovered objects; sizes reflect provisioned/used metrics per service.</p>
+<h2>Top Regions by Capacity</h2>
+$topRegionsHtml
+</body></html>
+"@
+$reportFile = Join-Path $OutputPath "azure_sizing_report_$timestamp.html"
+$report | Out-File -FilePath $reportFile -Encoding UTF8
+
+# Console pretty print
+Write-Host "`n================ WORKLOAD TOTALS ================" -ForegroundColor Cyan
+$byApp | Format-Table -AutoSize
+
+Write-Host "`n================ TOP REGIONS (by TiB) ================" -ForegroundColor Cyan
+$topRegions | Format-Table -AutoSize
+
+Write-Host "`n[INFO] Outputs"
+Write-Host " - $byAppFile"
+Write-Host " - $byRegionFile"
+Write-Host " - $reportFile"
+Write-Host " - Raw CSVs for each service in $OutputPath"
+Write-Host "`n[DONE] Azure sizing complete." -ForegroundColor Green
