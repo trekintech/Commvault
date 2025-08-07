@@ -9,17 +9,17 @@ Collects Azure workload inventory and capacity for backup sizing with regional b
 Discovers and sizes:
 - Azure VMs (count) and Managed Disks (capacity)
 - Azure SQL Databases and SQL Managed Instances
-- Storage Accounts (UsedCapacity metric), Azure Files, Table Storage (TableCapacity), ADLS Gen2
+- Storage Accounts (UsedCapacity), Azure Files (per share), Table Storage (TableCapacity), ADLS Gen2
 - Cosmos DB (DataUsage + IndexUsage)
 - Azure Database for MySQL/MariaDB/PostgreSQL
-- Optional: Oracle Database@Azure (if module available or installed on prompt)
+- Optional: Oracle Database@Azure (install/prompt supported)
 - Optional: Azure Backup (vaults, policies, items)
 
 Outputs
 - Per-app totals (Count, GiB, TiB)
 - Per-region/per-app breakdowns (Count, GiB, TiB)
+- HTML summary with totals AND “Capacity by Region & App”
 - Raw detail CSVs
-- HTML summary report
 
 Anonymisation (optional)
 - -AnonymizeScope None|ResourceGroups|Objects|All (default None)
@@ -64,8 +64,11 @@ param (
   [switch]$PromptInstallOracle
 )
 
-$ScriptVersion = "3.2.1"
+$ScriptVersion = "3.3.0"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
+
+# Reduce Get-AzMetric deprecation spam but keep real errors visible
+$PSDefaultParameterValues['Get-AzMetric:WarningAction'] = 'SilentlyContinue'
 
 #----------------------------
 # Helpers
@@ -125,7 +128,7 @@ if ($AnonymizeScope -ne 'None') {
   function Anon-Obj { param([string]$Name,[string]$Prefix='obj-') return $Name }
 }
 
-# Aggregate helpers (avoid '+=' on PSCustomObject)
+# Aggregate helpers
 function Add-Aggregate {
   param([hashtable]$Map,[string]$App,[string]$Region,[double]$SizeBytes)
   $key = "$App|$Region"
@@ -140,15 +143,83 @@ function Add-Aggregate {
 function New-List { New-Object System.Collections.ArrayList }
 function Add-ListItem { param([System.Collections.ArrayList]$List,[object]$Item) [void]$List.Add($Item) }
 
-function Get-ResourcesViaGraph { param([string]$ResourceType,[string]$SubscriptionId) $q="Resources | where type =~ '$ResourceType' and subscriptionId == '$SubscriptionId'"; try { Search-AzGraph -Query $q -ErrorAction SilentlyContinue } catch { @() } }
+# Generic metrics helper (with optional namespace and filter/dims)
 function Get-MetricBytes {
-  param([string]$ResourceId,[string]$MetricName,[int]$Days=2)
+  param(
+    [Parameter(Mandatory)][string]$ResourceId,
+    [Parameter(Mandatory)][string]$MetricName,
+    [int]$Days = 2,
+    [string]$MetricNamespace,
+    [string]$Filter,          # e.g. "ShareName eq 'myshare'"
+    [hashtable]$Dimensions    # e.g. @{ ShareName = 'myshare' }  (used if -Filter not supplied)
+  )
   try {
     $end = Get-Date; $start = $end.AddDays(-[math]::Max(1,$Days))
-    $m = Get-AzMetric -ResourceId $ResourceId -MetricName $MetricName -StartTime $start -EndTime $end -TimeGrain 01:00:00 -AggregationType Average -ErrorAction SilentlyContinue
-    $val = $m.Data | Where-Object { $_.Average -ne $null } | Select-Object -Last 1
+    $args = @{
+      ResourceId   = $ResourceId
+      MetricName   = $MetricName
+      StartTime    = $start
+      EndTime      = $end
+      TimeGrain    = [TimeSpan]::Parse("01:00:00")
+      AggregationType = 'Average'
+      ErrorAction  = 'SilentlyContinue'
+      WarningAction= 'SilentlyContinue'
+    }
+    if ($MetricNamespace) { $args.MetricNamespace = $MetricNamespace }
+    if ($Filter) { $args.Filter = $Filter }
+    elseif ($Dimensions) {
+      # Build a filter like: "Dim1 eq 'Val1' and Dim2 eq 'Val2'"
+      $pairs = @()
+      foreach ($k in $Dimensions.Keys) { $pairs += ("{0} eq '{1}'" -f $k,$Dimensions[$k].ToString().Replace("'","''")) }
+      if ($pairs.Count) { $args.Filter = ($pairs -join ' and ') }
+    }
+
+    $m = Get-AzMetric @args
+    if (-not $m) { return 0.0 }
+
+    # If dimensions present, pick the last datapoint from the first time series
+    $series = @()
+    foreach ($md in $m) { $series += $md.Timeseries }
+    if (-not $series) { $series = $m.Timeseries }
+
+    $points = @()
+    foreach ($ts in $series) { $points += $ts.Data }
+    if (-not $points) { $points = $m.Data }
+
+    $val = $points | Where-Object { $_.Average -ne $null } | Select-Object -Last 1
     if ($val) { return [double]$val.Average } else { return 0.0 }
-  } catch { return 0.0 }
+  } catch {
+    return 0.0
+  }
+}
+
+# Azure Files per-share via metric (falls back to ShareStats)
+function Get-FileShareUsedBytes {
+  param(
+    [Parameter(Mandatory)][string]$StorageAccountId,
+    [Parameter(Mandatory)][string]$ShareName,
+    $Context
+  )
+  # Try monitor metric with ShareName dimension (control-plane)
+  $rid = "$StorageAccountId/fileServices/default"
+  $bytes = Get-MetricBytes -ResourceId $rid `
+           -MetricName 'FileCapacity' `
+           -MetricNamespace 'Microsoft.Storage/storageAccounts/fileServices' `
+           -Filter ("ShareName eq '{0}'" -f $ShareName)
+  if ($bytes -gt 0) { return $bytes }
+
+  # Fallback to data-plane stats if role allows
+  try {
+    if ($Context) {
+      $sh = Get-AzStorageShare -Context $Context -Name $ShareName -ErrorAction SilentlyContinue
+      if ($sh) {
+        $stats = Get-AzStorageShareStats -Share $sh -Context $Context -ErrorAction SilentlyContinue
+        if ($stats -and $stats.Usage) { return [double]$stats.Usage }
+      }
+    }
+  } catch {}
+
+  return 0.0
 }
 
 #----------------------------
@@ -158,7 +229,7 @@ Test-RequiredModules
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# Collections -> ArrayList to avoid op_Addition issues
+# Collections -> ArrayList
 $AllVMs                = New-List
 $AllManagedDisks       = New-List
 $AllSQLDatabases       = New-List
@@ -276,7 +347,6 @@ function Collect-VMs-And-Disks {
     $loc = Normalize-Location $d.Location
     $sizeBytes = To-BytesFromGB $d.DiskSizeGB
 
-    # FIX: compute 'AttachedTo' first (avoid inline 'if' in hashtable)
     $attached = 'Unattached'
     if ($d.ManagedBy) {
       $vmName = Split-Path $d.ManagedBy -Leaf
@@ -338,7 +408,7 @@ function Collect-Storage {
   $sas = Get-AzStorageAccount -ErrorAction SilentlyContinue
   foreach ($sa in $sas) {
     $loc = Normalize-Location $sa.Location
-    $acctBytes = Get-MetricBytes -ResourceId $sa.Id -MetricName 'UsedCapacity' -Days 2
+    $acctBytes = Get-MetricBytes -ResourceId $sa.Id -MetricName 'UsedCapacity' -MetricNamespace 'Microsoft.Storage/storageAccounts' -Days 2
     Add-ListItem -List $AllStorageAccounts -Item ([pscustomobject]@{
       SubscriptionId=$SubId
       ResourceGroup=(Anon-RG $sa.ResourceGroupName)
@@ -364,14 +434,10 @@ function Collect-Storage {
     try {
       $ctx = $sa.Context
 
-      # Azure Files
+      # Azure Files (prefer monitor metric with ShareName dimension)
       $shares = Get-AzStorageShare -Context $ctx -ErrorAction SilentlyContinue
       foreach ($sh in $shares) {
-        $usageBytes = 0.0
-        try {
-          $stats = Get-AzStorageShareStats -Share $sh -Context $ctx -ErrorAction SilentlyContinue
-          if ($stats -and $stats.Usage) { $usageBytes = [double]$stats.Usage }
-        } catch {}
+        $usageBytes = Get-FileShareUsedBytes -StorageAccountId $sa.Id -ShareName $sh.Name -Context $ctx
         Add-ListItem -List $AllFileShares -Item ([pscustomobject]@{
           SubscriptionId=$SubId
           ResourceGroup=(Anon-RG $sa.ResourceGroupName)
@@ -385,7 +451,7 @@ function Collect-Storage {
 
       # Table Storage (service metric)
       $tableSvcId = "$($sa.Id)/tableServices/default"
-      $tableBytes = Get-MetricBytes -ResourceId $tableSvcId -MetricName 'TableCapacity' -Days 2
+      $tableBytes = Get-MetricBytes -ResourceId $tableSvcId -MetricName 'TableCapacity' -MetricNamespace 'Microsoft.Storage/storageAccounts/tableServices' -Days 2
       if ($tableBytes -gt 0) {
         Add-ListItem -List $AllTableStorage -Item ([pscustomobject]@{
           SubscriptionId=$SubId
@@ -423,6 +489,8 @@ function Collect-Storage {
   }
 }
 
+function Get-ResourcesViaGraph { param([string]$ResourceType,[string]$SubscriptionId) $q="Resources | where type =~ '$ResourceType' and subscriptionId == '$SubscriptionId'"; try { Search-AzGraph -Query $q -ErrorAction SilentlyContinue } catch { @() } }
+
 function Collect-Cosmos {
   param($SubId)
   Write-Host "  [Cosmos DB] $SubId" -ForegroundColor Cyan
@@ -430,8 +498,8 @@ function Collect-Cosmos {
   foreach ($c in $cosmos) {
     $loc = Normalize-Location $c.location
     $rid = "/subscriptions/$SubId/resourceGroups/$($c.resourceGroup)/providers/Microsoft.DocumentDB/databaseAccounts/$($c.name)"
-    $data = Get-MetricBytes -ResourceId $rid -MetricName 'DataUsage' -Days 2
-    $index = Get-MetricBytes -ResourceId $rid -MetricName 'IndexUsage' -Days 2
+    $data = Get-MetricBytes -ResourceId $rid -MetricName 'DataUsage'  -MetricNamespace 'Microsoft.DocumentDB/databaseAccounts' -Days 2
+    $index= Get-MetricBytes -ResourceId $rid -MetricName 'IndexUsage' -MetricNamespace 'Microsoft.DocumentDB/databaseAccounts' -Days 2
     $used = [double]$data + [double]$index
     Add-ListItem -List $AllCosmosDBAccounts -Item ([pscustomobject]@{
       SubscriptionId=$SubId
@@ -600,13 +668,27 @@ $byApp = foreach ($v in ($TotalsByApp.Values | Sort-Object App)) {
 $byAppFile = Join-Path $OutputPath "azure_sizing_by_app_$timestamp.csv"
 $byApp | Export-Csv -Path $byAppFile -NoTypeInformation
 
-# Per-region per-app
+# Per-region per-app (flat)
 $byRegionApp = foreach ($v in ($Aggregates.Values | Sort-Object Region,App)) {
   $conv = Convert-Bytes $v.Bytes
   [pscustomobject]@{ Region=$v.Region; App=$v.App; Count=$v.Count; Size_GiB=$conv.GiB; Size_TiB=$conv.TiB }
 }
 $byRegionFile = Join-Path $OutputPath "azure_sizing_by_region_$timestamp.csv"
 $byRegionApp | Export-Csv -Path $byRegionFile -NoTypeInformation
+
+# Pivot for HTML: Capacity by Region & App (TiB)
+$pivotRows = @()
+$regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
+$apps    = $byRegionApp | Select-Object -ExpandProperty App    -Unique | Sort-Object
+foreach ($r in $regions) {
+  $row = [ordered]@{ Region = $r }
+  foreach ($a in $apps) {
+    $val = ($byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a } | Select-Object -ExpandProperty Size_TiB -ErrorAction SilentlyContinue)
+    if (-not $val) { $row[$a] = 0 } else { $row[$a] = [math]::Round(($val | Measure-Object -Sum).Sum, 3) }
+  }
+  $pivotRows += [pscustomobject]$row
+}
+$pivotHtml = $pivotRows | ConvertTo-Html -Fragment
 
 # Raw detail CSVs
 if ($AllVMs.Count)                { $AllVMs                | Export-Csv (Join-Path $OutputPath "azure_vms_$timestamp.csv") -NoTypeInformation }
@@ -642,6 +724,7 @@ tr:nth-child(even) { background: #fafafa; }
 $totalGiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1GB, 2)
 $totalTiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1TB, 3)
 $byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
+
 $topRegions = $byRegionApp | Group-Object Region | ForEach-Object {
   [pscustomobject]@{
     Region = $_.Name
@@ -650,6 +733,7 @@ $topRegions = $byRegionApp | Group-Object Region | ForEach-Object {
   }
 } | Sort-Object TiB -Descending | Select-Object -First 10
 $topRegionsHtml = $topRegions | ConvertTo-Html -Property Region,Resources,TiB -Fragment
+
 $report = @"
 <html><head><meta charset="utf-8"><title>Azure Sizing Report</title>$css</head>
 <body>
@@ -658,8 +742,10 @@ $report = @"
 <h2>Totals by App</h2>
 $byAppHtml
 <p class="note">Sizes shown in GiB/TiB (1024-based). Counts reflect discovered objects; sizes reflect provisioned/used metrics per service.</p>
-<h2>Top Regions by Capacity</h2>
+<h2>Top Regions by Total Capacity</h2>
 $topRegionsHtml
+<h2>Capacity by Region & App (TiB)</h2>
+$pivotHtml
 </body></html>
 "@
 $reportFile = Join-Path $OutputPath "azure_sizing_report_$timestamp.html"
