@@ -1,272 +1,209 @@
-# Get-AzureSizingInfo.ps1 — Azure inventory & capacity for backup sizing
+# Azure Sizing & Inventory Script
 
-Collects Azure inventory and capacity to feed a backup sizing exercise (e.g., for Commvault). Generates clean CSVs and a simple HTML report with **counts** and **GiB/TiB** per app and **per region**. Vendor-neutral, fast by default, and optionally anonymises names.
+## Overview
+This PowerShell script collects detailed sizing and inventory information for a wide range of Azure workloads.  
+It is intended to support backup sizing, cost estimation, and capacity planning by providing **counts, sizes, and regional breakdowns** of supported resources.
 
----
+The script connects to your Azure tenant, enumerates resources across the specified subscription(s), and produces:
+- A **count** of each application type
+- The **total size** of those workloads in both **GiB** and **TiB**
+- A **regional breakdown** of capacity usage
 
-## Table of Contents
-
-* [What it does (default)](#what-it-does-default)
-* [Requirements](#requirements)
-* [Permissions](#permissions)
-* [Installation](#installation)
-* [Quick Start](#quick-start)
-* [Optional Workflows](#optional-workflows)
-
-  * [Targeting scope](#targeting-scope)
-  * [Performance controls](#performance-controls)
-  * [Anonymisation](#anonymisation)
-  * [Azure Backup & Oracle@Azure](#azure-backup--oracleazure)
-  * [Cloud Shell / headless](#cloud-shell--headless)
-* [Sizing method (per workload)](#sizing-method-per-workload)
-* [Outputs](#outputs)
-* [Performance tips](#performance-tips)
-* [Troubleshooting](#troubleshooting)
-* [Assumptions & notes](#assumptions--notes)
-* [Example: full, anonymised run](#example-full-anonymised-run)
-* [License](#license)
+Optionally, it can:
+- Anonymise **resource group** and/or **object names**
+- Automatically install missing Az.* modules (including Az.Oracle)
+- Include Azure NetApp Files in reporting
+- Export results to CSV, JSON, and HTML reports
 
 ---
 
-## What it does (default)
+## Prerequisites
 
-Runs against the subscriptions you choose and produces **three primary outputs** plus **raw detail CSVs**:
+Before running the script, ensure the following:
+1. **PowerShell 7.0 or later**
+2. The following Az modules are installed and up-to-date:
+   - `Az.Accounts`
+   - `Az.Compute`
+   - `Az.Storage`
+   - `Az.Sql`
+   - `Az.SqlVirtualMachine`
+   - `Az.ResourceGraph`
+   - `Az.Monitor`
+   - `Az.Resources`
+   - `Az.RecoveryServices`
+   - `Az.CostManagement`
+   - `Az.CosmosDB`
+   - `Az.MySql`
+   - `Az.MariaDb`
+   - `Az.PostgreSql`
+   - `Az.Table`
+   - `Az.NetAppFiles` *(only if collecting ANF data)*
+   - `Az.Oracle` *(only if collecting Oracle@Azure data)*
 
-1. `azure_sizing_by_app_<timestamp>.csv`
-   *App, Count, Size\_GiB, Size\_TiB*
+   The script can install these for you if you use `-AutoInstallModules` or `-PromptInstallOracle`.
 
-2. `azure_sizing_by_region_<timestamp>.csv`
-   *Region, App, Count, Size\_GiB, Size\_TiB*
-
-3. `azure_sizing_report_<timestamp>.html`
-   Simple, styled summary you can share or paste into slides
-
-4. Raw CSVs per workload for traceability (VMs, Disks, SQL, Storage, Files, Tables, ADLS Gen2, Cosmos, PaaS DBs, Backup, Oracle)
-
-**Discovered / sized by default**
-
-* **Azure VMs** (count) and **Managed Disks** (provisioned capacity)
-* **Azure SQL DB** (`MaxSizeBytes`) and **SQL Managed Instance** (`StorageSizeInGB`)
-* **Storage Accounts** (`UsedCapacity` metric), **Azure Files**, **Table Storage** (`TableCapacity` metric), **ADLS Gen2**
-* **Cosmos DB** (`DataUsage + IndexUsage`)
-* **Azure DB for MySQL/MariaDB/PostgreSQL** (allocated storage)
-* **Azure Backup** (vaults/policies/items inventory)
-* **Oracle Database\@Azure** (if `Az.Oracle` is present)
-
-**Defaults**
-
-* Uses **Resource Graph** and **Metrics** APIs (fast, low impact)
-* **Does not** enumerate every blob (you can enable it)
-* Reports sizes in **GiB/TiB (1024-based)**
+3. You must have:
+   - **Reader** or equivalent rights on the subscriptions you wish to inventory
+   - **Storage Account Data Reader** permissions for collecting capacity details from Azure Storage
 
 ---
 
-## Requirements
+## Usage
 
-* **PowerShell** 7.0+
-* **Login:** `Connect-AzAccount`
-* **Modules** (auto-install supported):
-
-  * **Required:** `Az.Accounts, Az.Compute, Az.Storage, Az.Sql, Az.SqlVirtualMachine, Az.ResourceGraph, Az.Monitor, Az.Resources`
-  * **Optional:** `Az.RecoveryServices, Az.CosmosDB, Az.MySql, Az.MariaDb, Az.PostgreSql, Az.Oracle`
-
----
-
-## Permissions
-
-Minimum recommended roles (assign at subscription or resource scope as appropriate):
-
-| Feature                                     | Role(s)                                        |
-| ------------------------------------------- | ---------------------------------------------- |
-| Enumerate resources                         | **Reader**                                     |
-| Read metrics (storage, cosmos, etc.)        | **Monitoring Reader**                          |
-| Azure Files usage (data plane)              | **Storage File Data SMB Share Reader**         |
-| Blob containers (if `-GetContainerDetails`) | **Storage Blob Data Reader**                   |
-| Azure Backup inventory                      | **Backup Reader**                              |
-| Oracle\@Azure (if used)                     | Reader + any `Az.Oracle`-specific requirements |
-
-> With defaults (no blob-per-container), **Reader + Monitoring Reader** is typically sufficient.
-
----
-
-## Installation
+### Basic Run
+Run the script without optional parameters to process all accessible subscriptions:
 
 ```powershell
-# Optional helper: auto-install required Az.* modules when missing
-Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources -Scope CurrentUser -Force
-# Optional extras if you need those features:
-Install-Module Az.RecoveryServices,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql,Az.Oracle -Scope CurrentUser -Force
+.\Get-AzureSizingInfo.ps1
+````
+
+---
+
+### Optional Parameters
+
+#### `-Subscriptions`
+
+Limit the run to specific subscription IDs or names.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -Subscriptions "My Production Subscription", "My DR Subscription"
+```
+
+#### `-AnonymiseResourceGroups`
+
+Replace all **Resource Group** names in output with anonymised labels.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -AnonymiseResourceGroups
+```
+
+#### `-AnonymiseObjectNames`
+
+Replace all resource names (VM names, DB names, storage account names, etc.) with anonymised labels.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -AnonymiseObjectNames
+```
+
+#### `-AutoInstallModules`
+
+Automatically install any missing required Az modules, including `Az.Oracle` for Oracle\@Azure.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -AutoInstallModules
+```
+
+#### `-PromptInstallOracle`
+
+If `Az.Oracle` is missing, prompt the user to install it so Oracle\@Azure data can be collected.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -PromptInstallOracle
+```
+
+#### `-IncludeNetAppFiles`
+
+Collect data for Azure NetApp Files volumes and include in totals.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -IncludeNetAppFiles
+```
+
+#### `-ExportCsv "path"`
+
+Export summary and regional data to CSV.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -ExportCsv "C:\Reports\AzureSizing.csv"
+```
+
+#### `-ExportHtml "path"`
+
+Export a formatted HTML report.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -ExportHtml "C:\Reports\AzureSizing.html"
 ```
 
 ---
 
-## Quick Start
+## How Capacity Is Accounted For
 
-```powershell
-# Current subscription, outputs to .\out
-.\Get-AzureSizingInfo.ps1 -CurrentSubscription -OutputPath .\out
+Azure Storage accounts can contain **multiple services**:
 
-# All subscriptions you can see
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -OutputPath .\out
+* **Blob Storage** (Block Blobs, Page Blobs, Append Blobs)
+* **Azure Files** (SMB/NFS shares)
+* **Table Storage**
 
-# Auto-install required modules if missing
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -AutoInstallModules -OutputPath .\out
+The script **queries storage capacity at the account level**, so Blob, Files, and Table usage are **rolled up into the `Storage Account` total**.
+
+---
+
+### Capacity Roll-Up Diagram
+
+```
+   ┌──────────────────────────────┐
+   │        Storage Account        │
+   │   (reported total capacity)   │
+   └──────────────┬────────────────┘
+                  │
+   ┌──────────────┼──────────────┐
+   │              │              │
+Blob Storage   Azure Files    Table Storage
+ (all types)   (all shares)   (all tables)
+   │              │              │
+   ▼              ▼              ▼
+Counted in    Counted in    Counted in
+Storage       Storage       Storage
+Account       Account       Account
+total         total         total
 ```
 
----
+**Important:**
 
-## Optional Workflows
-
-### Targeting scope
-
-```powershell
-# Specific subscriptions (names or IDs)
-.\Get-AzureSizingInfo.ps1 -Subscriptions "Prod-Sub","11111111-2222-3333-4444-555555555555" -OutputPath .\out
-
-# Management groups (recurses to their subscriptions)
-.\Get-AzureSizingInfo.ps1 -ManagementGroups "Corp","Sandbox" -OutputPath .\out
-```
-
-### Performance controls
-
-```powershell
-# Include per-container blob detail (can be slow/heavy)
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -GetContainerDetails -OutputPath .\out
-
-# Skip collectors you don't need
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions `
-  -SkipAzureBackup -SkipOracleDatabase -SkipAzureCosmosDB `
-  -OutputPath .\out
-```
-
-### Anonymisation
-
-Deterministic pseudonyms for **resource groups** and/or **object names** while keeping regions, counts, and sizes intact.
-
-```powershell
-# Anonymise both RGs and object names (stable with the provided salt)
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions `
-  -AnonymizeScope All -AnonymizeSalt "tenant-or-project-secret" `
-  -OutputPath .\out
-
-# Only anonymise resource groups
-.\Get-AzureSizingInfo.ps1 -CurrentSubscription `
-  -AnonymizeScope ResourceGroups -AnonymizeSalt "my-salt" `
-  -OutputPath .\out
-
-# Only anonymise object names
-.\Get-AzureSizingInfo.ps1 -Subscriptions "Prod-Sub" `
-  -AnonymizeScope Objects -AnonymizeSalt "my-salt" `
-  -OutputPath .\out
-```
-
-### Azure Backup & Oracle\@Azure
-
-```powershell
-# Include Azure Backup (needs Backup Reader on vaults)
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -OutputPath .\out
-
-# Oracle@Azure is included if Az.Oracle is installed; otherwise it’s skipped
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -OutputPath .\out
-
-# Explicitly skip either
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -SkipAzureBackup -SkipOracleDatabase -OutputPath .\out
-```
-
-### Cloud Shell / headless
-
-```powershell
-# Azure Cloud Shell (modules usually preloaded)
-./Get-AzureSizingInfo.ps1 -CurrentSubscription -OutputPath $HOME/out
-```
+* `Storage Account` capacity = Blob + Files + Table combined.
+* The `Azure Files` and `Table Storage` rows in the report show **counts** only; their sizes are not *removed* from the Storage Account total, so adding them together will **double count**.
+* This design ensures total capacity is accurate for sizing but means service-specific sizes are only available if we query them separately.
 
 ---
 
-## Sizing method (per workload)
+## Output Interpretation
 
-| Workload                 | Count |                Size basis | Notes                                            |
-| ------------------------ | ----: | ------------------------: | ------------------------------------------------ |
-| Azure VM                 |     ✓ |                       n/a | VM **count**; capacity comes from disks          |
-| Managed Disk             |     ✓ |            Provisioned GB | Sum of OS + data disks (control plane)           |
-| Azure SQL DB             |     ✓ |            `MaxSizeBytes` | Excludes `master`                                |
-| SQL MI                   |     ✓ |         `StorageSizeInGB` | Converted to bytes for consistent math           |
-| Storage Account          |     ✓ |     `UsedCapacity` metric | Includes all services; ADLS Gen2 via same metric |
-| Blob Container           |   ✓\* |       Sum of blob lengths | **Only with** `-GetContainerDetails`             |
-| Azure Files              |     ✓ | `Get-AzStorageShareStats` | Data-plane call; needs file data reader role     |
-| Table Storage            |     ✓ |    `TableCapacity` metric | May be missing/disabled in some tenants          |
-| Cosmos DB                |     ✓ |  `DataUsage + IndexUsage` | Account-level metrics                            |
-| MySQL/MariaDB/PostgreSQL |     ✓ |         Allocated storage | From server StorageProfile                       |
-| Azure Backup             |     ✓ |                       n/a | Inventory of vaults, policies, items             |
-| Oracle\@Azure            |     ✓ |          Reported storage | Via `Az.Oracle` when available                   |
+The script generates two main summaries:
 
-All sizes are normalised to **GiB/TiB** (1024-based).
+1. **Workload Totals**
+   Shows the **count** of each application type, plus the **total capacity** in GiB and TiB.
 
----
+   Example:
 
-## Outputs
+   ```
+   App             Count Size_GiB Size_TiB
+   ---             ----- -------- --------
+   Azure VM           28        0        0
+   Managed Disk       48     3850     3.76
+   Storage Account    26   427.54    0.418
+   Azure Files         6        0        0
+   Table Storage      26        0        0
+   ```
 
-Primary:
+2. **Top Regions (by TiB)**
+   Shows which Azure regions have the most capacity usage.
 
-* `azure_sizing_by_app_<timestamp>.csv` — **App, Count, Size\_GiB, Size\_TiB**
-* `azure_sizing_by_region_<timestamp>.csv` — **Region, App, Count, Size\_GiB, Size\_TiB**
-* `azure_sizing_report_<timestamp>.html` — lightweight HTML summary
+   Example:
 
-Raw details (for traceability):
-
-* `azure_vms_*.csv`, `azure_managed_disks_*.csv`, `azure_sql_databases_*.csv`, `azure_sql_managed_instances_*.csv`
-* `azure_storage_accounts_*.csv`, `azure_blob_containers_*.csv`, `azure_file_shares_*.csv`, `azure_table_storage_*.csv`, `azure_datalake_gen2_*.csv`
-* `azure_cosmosdb_accounts_*.csv`, `azure_mariadb_servers_*.csv`, `azure_mysql_servers_*.csv`, `azure_postgresql_servers_*.csv`
-* `azure_backup_vaults_*.csv`, `azure_backup_policies_*.csv`, `azure_backup_items_*.csv`
-* `azure_oracle_databases_*.csv` (if applicable)
+   ```
+   Region        Resources   TiB
+   ------        ---------   ---
+   westeurope           61 2.319
+   eastus2              29 1.276
+   uksouth               2 0.124
+   ```
 
 ---
 
-## Performance tips
+## Notes
 
-* Prefer **default** mode (Resource Graph + metrics).
-* Avoid `-GetContainerDetails` unless truly needed.
-* Use management group targeting to split work by teams.
-* Skip collectors you don’t need via `-Skip*` switches.
+* For **Azure Files**, the size value may appear as `0` if per-share metrics are unavailable in that region/SKU. The actual capacity is still counted in the `Storage Account` total.
+* Capacity numbers for Blob, Files, and Table are **aggregated at the storage account level**. The service-specific rows (`Azure Files`, `Table Storage`) are primarily for inventory purposes.
+* To get exact per-share or per-service capacity, a separate data-plane API query is required.
 
----
-
-## Troubleshooting
-
-* **Missing modules**
-  Re-run with `-AutoInstallModules` or pre-install with `Install-Module Az.<name> -Scope CurrentUser`.
-
-* **Metrics are zero/missing**
-  Ensure **Monitoring Reader** at the right scope and that the resource emits the metric (some services/tenants differ).
-
-* **Azure Files / Blob container access fails**
-  Add data-plane roles: **Storage File Data SMB Share Reader** and/or **Storage Blob Data Reader**.
-
-* **Azure Backup empty**
-  Confirm **Backup Reader** on the Recovery Services vaults.
-
-* **Throttling/timeouts**
-  Reduce scope, avoid `-GetContainerDetails`, or skip optional collectors.
-
----
-
-## Assumptions & notes
-
-* **Metrics lag:** Azure metrics can be delayed by \~5–30 minutes. The script uses the latest non-null average in a recent window.
-* **Provisioned vs. used:** Many services report **allocated** capacity (which is often what you need for protection sizing).
-* **Regions:** Uses Azure’s canonical short names (e.g., `westeurope`).
-
----
-
-## Example: full, anonymised run
-
-```powershell
-.\Get-AzureSizingInfo.ps1 -AllSubscriptions -AutoInstallModules `
-  -AnonymizeScope All -AnonymizeSalt "project-salt" `
-  -OutputPath .\out
-```
-
----
-
-## License
-
-Vendor-neutral utility intended to support backup sizing workflows (including Commvault). Use at your own risk; validate outputs before committing capacity.
