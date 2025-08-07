@@ -1,194 +1,173 @@
-# Azure Sizing Information Script (Commvault Edition)
+# Commvault Azure Sizing Information Collection Script
 
 ## Overview
-This PowerShell script collects **resource sizing information** across one or more Azure subscriptions.  
-It’s designed for **backup sizing, capacity planning, and workload inventory**.  
-Supports key Azure workloads such as VMs, Disks, SQL DBs, Storage Accounts, and more.
 
-It **does not** show what is actually backed up — it shows what exists so you can size for protection.
+This PowerShell script collects metadata and sizing information for supported Azure workloads to help with backup sizing and planning.  
+It works across **all Azure subscriptions** you have **Reader** access to by default, or can be restricted to specific subscriptions with the `-SubscriptionIds` parameter.
+
+It collects and aggregates information for:
+
+- Azure Virtual Machines and Managed Disks
+- Azure SQL Databases and Managed Instances
+- Azure Storage Accounts (Blob, Files, Table)
+- Azure Data Lake Storage Gen2 (if present in the account — see note below)
+- Azure Cosmos DB
+- Azure Databases for MySQL, MariaDB, and PostgreSQL
+- Azure Table Storage
+- Azure Backup–protected items
+
+> **Note on ADLS Gen2**  
+> ADLS Gen2 capacity is included in **Storage Account** totals if it exists, but the script does not explicitly label ADLS Gen2 usage separately.  
+> To confirm ADLS Gen2 use, you will need to check the storage account configuration directly.
 
 ---
 
 ## Prerequisites
 
-### PowerShell
-- **PowerShell 7.0+** (recommended)
+- **PowerShell 7.0+**
+- Az PowerShell modules:
+  - `Az.Accounts`
+  - `Az.Compute`
+  - `Az.Storage`
+  - `Az.Sql`
+  - `Az.SqlVirtualMachine`
+  - `Az.ResourceGraph`
+  - `Az.Monitor`
+  - `Az.Resources`
+  - `Az.RecoveryServices`
+  - `Az.CostManagement`
+  - `Az.CosmosDB`
+  - `Az.MySql`
+  - `Az.MariaDb`
+  - `Az.PostgreSql`
+  - `Az.Table`
 
-### Azure PowerShell Modules
-The following Az modules must be installed:
-- `Az.Accounts`
-- `Az.Compute`
-- `Az.Storage`
-- `Az.Sql`
-- `Az.SqlVirtualMachine`
-- `Az.ResourceGraph`
-- `Az.Monitor`
-- `Az.Resources`
-- `Az.RecoveryServices`
-- `Az.CostManagement`
-- `Az.CosmosDB`
-- `Az.MySql`
-- `Az.MariaDb`
-- `Az.PostgreSql`
-- `Az.Table`
-- *(Optional)* `Az.Oracle` for Oracle@Azure discovery
-
-You can install missing modules with:
+Install missing modules (example):
 ```powershell
-Install-Module -Name Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CostManagement,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql,Az.Table -Force
+Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CostManagement,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql,Az.Table -Scope CurrentUser
 ````
 
 ---
 
-## Optional Parameters
+## Permissions Required
 
-* **`-PromptInstallOracle`** – If `Az.Oracle` is missing, prompt to install before continuing.
-* **`-AutoInstallModules`** – Automatically install missing required modules without prompting.
+* **Minimum**: Built-in `Reader` role at the **subscription scope** (sufficient for all default collection paths used by the script)
+* **Optional**: For the Azure Files **data-plane fallback** (used if metrics are unavailable), you will also need either:
+
+  * The **Storage Blob Data Reader** role on the storage account, or
+  * Access via an account key or SAS token
 
 ---
 
-## Usage Examples
+## How Subscriptions Are Handled
 
-### 1. Scan current subscription
+By default, the script queries **all subscriptions** you have `Reader` access to.
+
+To restrict to specific subscriptions:
 
 ```powershell
-.\Get-AzureSizingInfo.ps1
+.\Get-AzureSizingInfo.ps1 -SubscriptionIds "sub1","sub2"
 ```
 
-### 2. Scan multiple subscriptions
+Where `sub1` and `sub2` are Azure subscription GUIDs.
+
+---
+
+## Optional Parameters and Workflows
+
+### 1. Restrict to Specific Subscriptions
 
 ```powershell
-.\Get-AzureSizingInfo.ps1 -SubscriptionIds @("sub-id-1","sub-id-2")
+.\Get-AzureSizingInfo.ps1 -SubscriptionIds "11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222"
 ```
 
-### 3. Include Oracle\@Azure discovery
+### 2. Anonymise Resource Group and Object Names
 
 ```powershell
-.\Get-AzureSizingInfo.ps1 -PromptInstallOracle
+.\Get-AzureSizingInfo.ps1 -AnonymiseNames
+```
+
+Replaces resource group and object names with anonymised labels in the output.
+
+### 3. Output Formats
+
+By default, the script outputs tables in the console and saves CSV/HTML summaries.
+
+```powershell
+.\Get-AzureSizingInfo.ps1 -OutputPath "C:\Reports"
 ```
 
 ---
 
-## What It Collects
+## How Capacity Is Counted
 
-The script collects high-level counts and sizes (GiB/TiB) for:
+The script reports **Storage Account** capacity as an aggregate across services:
 
-* Azure VMs (with or without SQL)
-* Managed Disks
-* Azure SQL DBs
-* Azure Managed Instances
-* Storage Accounts (total size — includes Blob, File, Table, ADLS Gen2)
-* Azure Files (only if available via metrics)
-* Azure Data Lake Storage Gen2 *(counted within Storage Account total, no separate line)*
-* Cosmos DB
-* Azure Database for MySQL/MariaDB/PostgreSQL
-* Azure Table Storage
-* Azure Backup-protected items
-
----
-
-## How Capacity is Counted
-
-### Storage Accounts, Blob, Files, Tables, ADLS Gen2
-
-* The **Storage Account** total is the **sum of all contained services**.
-* **Blob**, **File Shares**, **Table Storage**, and **ADLS Gen2** are *rolled up into the Storage Account size*.
-* The script **does not split out** the capacity per service by default.
-* This means **File Share size** will be part of the Storage Account’s reported TiB value.
-* **ADLS Gen2** (which runs on top of Blob) is also part of the Storage Account total — the script cannot detect if it’s being used without additional API calls.
-
----
-
-## Visual: Capacity Relationship
-
-```text
-Storage Account Total Size
-┌─────────────────────────┐
-│  Storage Account (TiB)  │  <─ Reported by script
-└───────────┬─────────────┘
-            │
-   ┌────────┼─────────┬────────┐
-   │        │         │        │
-  Blob   File Share  Table   ADLS Gen2
- (GB)     (GB)      (GB)     (GB)
+```
+ ┌───────────────────────────┐
+ │   Storage Account Total   │
+ └──────────────┬────────────┘
+                │
+     ┌──────────┼──────────┬──────────┐
+     │          │          │          │
+   Blob       Files      Tables    (ADLS Gen2 if present)
 ```
 
-*In the script output, these individual service sizes are not broken out; they are rolled into the Storage Account total.*
+* **Blob**: All blob container capacity in the account
+* **Files**: All SMB file shares in the account
+  (counted inside Storage Account total, not broken out separately in capacity totals unless the optional data-plane path is used)
+* **Tables**: Azure Table Storage capacity
+* **ADLS Gen2**: Counted inside the storage account total if enabled; not labelled separately in the output
+
+> This means that the **Storage Account total already includes** capacity from Files, Blob, Table, and any ADLS Gen2 usage.
+> Individual workload tables (e.g. “Azure Files”) list object counts but will not show separate capacity unless the metrics API returns it for that service.
 
 ---
 
-## Example: Mixed-Use Storage Account
-
-Below is an example where **one Storage Account** contains multiple service types.
-
-```text
-Storage Account: SA-WestEurope
-Reported total: 12 TiB
-┌─────────────────────────────┐
-│ Storage Account Total: 12TiB│  <─ Reported by script
-└───────────┬─────────────────┘
-            │
-   ┌────────┼────────┐────────┐
-   │        │        │        │
-  Blob   File Share Table   ADLS Gen2
-  8 TiB   3 TiB     0.5 TiB  0.5 TiB
-```
-
-### How the script reports:
-
-* **Storage Account Total** = 12 TiB *(sum of all services in that account)*
-* No per-service breakdown — Blob, File, Table, and ADLS Gen2 are all **rolled up into the Storage Account line**
-* To separate these numbers, you would need **data plane API calls** for each service
-
----
-
-## Regions in the Output
-
-* Each resource is tied to its **Azure region**.
-* The script will summarise:
-
-  * **Count per region**
-  * **Capacity (TiB) per region**
-* Storage Account totals are attributed to the region where the account is hosted.
-
----
-
-## Limitations
-
-* Azure Files usage metrics are **not always available** — depends on region, SKU, and metric configuration.
-* No separation of Blob vs File vs ADLS Gen2 capacity without extra queries.
-* ADLS Gen2 usage is **counted within the Storage Account total**, but **cannot be flagged as “ADLS in use”** by this script alone.
-* Some services may have 0 capacity if they exist but have no provisioned/used storage.
-
----
-
-## Example Output
+## Example Output Sections
 
 ### Workload Totals
 
-```text
-App             Count  Size_GiB  Size_TiB
----             -----  --------  --------
-Azure VM           28         0     0
-Managed Disk       48      3850  3.76
-Azure SQL DB        5       288  0.281
-Storage Account    26     427.5  0.418
-Cosmos DB           2         0     0
-...
+```
+App             Count Size_GiB Size_TiB
+---             ----- -------- --------
+ADLS Gen2           1        0        0
+Azure Files         6        0        0
+Azure SQL DB        5      288    0.281
+Azure VM           28        0        0
+Cosmos DB           2        0        0
+Managed Disk       48     3850     3.76
+Storage Account    26   427.54    0.418
+Table Storage      26        0        0
 ```
 
-### Regions by TiB
+### Top Regions (by TiB)
 
-```text
+```
 Region        Resources   TiB
 ------        ---------   ---
 westeurope           61 2.319
 eastus2              29 1.276
+eastus               26 0.571
+australiaeast        12 0.154
 uksouth               2 0.124
-...
-```
-
 ```
 
 ---
 
+## Example Full Run
+
+```powershell
+# Default run against all subscriptions
+.\Get-AzureSizingInfo.ps1
+
+# Against specific subscriptions with anonymised names
+.\Get-AzureSizingInfo.ps1 -SubscriptionIds "sub1","sub2" -AnonymiseNames -OutputPath "C:\Reports"
+```
+
+---
+
+## Notes
+
+* Some storage service capacities (Azure Files, Table, ADLS Gen2) may return `0` if metrics are not enabled or supported in that region/SKU.
+* If Azure Files capacity is critical for your sizing, ensure **Storage metrics** are enabled, or grant **Storage Blob Data Reader** permissions for the optional data-plane query.
