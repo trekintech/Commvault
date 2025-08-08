@@ -621,8 +621,13 @@ function Collect-Backup {
         $items = Get-AzRecoveryServicesBackupItem -Container $c -WorkloadType AzureVM -ErrorAction SilentlyContinue
         foreach ($i in $items) {
           Add-ListItem -List $AllBackupItems -Item ([pscustomobject]@{
-            SubscriptionId=$SubId; VaultName=(Anon-Obj $v.Name 'vault-'); ItemName=(Anon-Obj $i.Name 'bkpitem-');
-            ProtectionState=$i.ProtectionState; LastBackupTime=$i.LastBackupTime
+            SubscriptionId = $SubId
+            VaultName      = (Anon-Obj $v.Name 'vault-')
+            Location       = $loc
+            WorkloadType   = $i.WorkloadType
+            BackupManagementType = $i.BackupManagementType
+            ProtectionState = $i.ProtectionState
+            LastBackupTime  = $i.LastBackupTime
           })
         }
       }
@@ -670,6 +675,40 @@ $byRegionApp = foreach ($v in ($Aggregates.Values | Sort-Object Region,App)) {
 }
 $byRegionFile = Join-Path $OutputPath "azure_sizing_by_region_$timestamp.csv"
 $byRegionApp | Export-Csv -Path $byRegionFile -NoTypeInformation
+
+# Backup protection counts
+$protectedCounts = @{}
+foreach ($b in $AllBackupItems) {
+  $key = "$($b.WorkloadType)|$($b.Location)"
+  if (-not $protectedCounts.ContainsKey($key)) {
+    $protectedCounts[$key] = [pscustomobject]@{ Workload=$b.WorkloadType; Region=$b.Location; Count=0; OnPrem=$false }
+  }
+  $protectedCounts[$key].Count++
+  if ($b.BackupManagementType -ne 'AzureIaasVM') { $protectedCounts[$key].OnPrem = $true }
+}
+
+# Discovery vs protection summary
+$backupSummary = foreach ($rec in $byRegionApp) {
+  $key = "$($rec.App)|$($rec.Region)"
+  $protCount = 0
+  $protDisplay = '0'
+  if ($protectedCounts.ContainsKey($key)) {
+    $protCount = $protectedCounts[$key].Count
+    $protDisplay = $protCount.ToString()
+    if ($protectedCounts[$key].OnPrem) { $protDisplay += '*' }
+  }
+  [pscustomobject]@{
+    Region      = $rec.Region
+    Workload    = $rec.App
+    Discovered  = $rec.Count
+    Protected   = $protDisplay
+    Delta       = $rec.Count - $protCount
+  }
+}
+
+$backupSummaryFile = Join-Path $OutputPath "azure_backup_summary_$timestamp.csv"
+$backupSummary | Export-Csv -Path $backupSummaryFile -NoTypeInformation
+$backupSummaryHtml = $backupSummary | ConvertTo-Html -Fragment
 
 # Pivot for HTML: Capacity by Region & App (TiB)
 $pivotRows = @()
@@ -759,6 +798,9 @@ $byAppHtml
 $topRegionsHtml
 <h2>Capacity by Region & App (TiB)</h2>
 $pivotHtml
+<h2>Backup Protection (Discovered vs Protected)</h2>
+<p class="note">Counts marked with * indicate on-prem workloads.</p>
+$backupSummaryHtml
 </body></html>
 "@
 $reportFile = Join-Path $OutputPath "azure_sizing_report_$timestamp.html"
