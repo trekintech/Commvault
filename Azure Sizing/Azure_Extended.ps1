@@ -431,6 +431,8 @@ function Collect-Storage {
         SubscriptionId=$SubId; ResourceGroup=(Anon-RG $sa.ResourceGroupName); StorageAccountName=(Anon-Obj $sa.StorageAccountName 'stg-');
         Location=$loc; UsedBytes=$acctBytes
       })
+      # Count ADLS Gen2 accounts (size accounted at storage account level)
+      Add-Aggregate -Map $Aggregates -App 'ADLS Gen2' -Region $loc -SizeBytes 0
     }
 
     try {
@@ -687,42 +689,32 @@ foreach ($b in $AllBackupItems) {
   if ($b.BackupManagementType -ne 'AzureIaasVM') { $protectedCounts[$key].OnPrem = $true }
 }
 
-# Discovery vs protection summary
+# Discovery vs protection summary with size estimates
 $backupSummary = foreach ($rec in $byRegionApp) {
   $key = "$($rec.App)|$($rec.Region)"
   $protCount = 0
-  $protDisplay = '0'
+  $onPrem = $false
   if ($protectedCounts.ContainsKey($key)) {
     $protCount = $protectedCounts[$key].Count
-    $protDisplay = $protCount.ToString()
-    if ($protectedCounts[$key].OnPrem) { $protDisplay += '*' }
+    $onPrem = $protectedCounts[$key].OnPrem
   }
+  $protDisplay = $protCount.ToString()
+  if ($onPrem) { $protDisplay += '*' }
+  $pct = if ($rec.Count -gt 0) { [math]::Round(($protCount / $rec.Count) * 100, 0) } else { 0 }
+  $protSize = if ($rec.Count -gt 0) { [math]::Round($rec.Size_TiB * ($protCount / $rec.Count), 3) } else { 0 }
   [pscustomobject]@{
-    Region      = $rec.Region
-    Workload    = $rec.App
-    Discovered  = $rec.Count
-    Protected   = $protDisplay
-    Delta       = $rec.Count - $protCount
+    Region            = $rec.Region
+    Workload          = $rec.App
+    Discovered        = $rec.Count
+    Protected         = $protDisplay
+    '% Protected'     = "$pct%"
+    'Protected Size TiB' = $protSize
   }
 }
 
 $backupSummaryFile = Join-Path $OutputPath "azure_backup_summary_$timestamp.csv"
 $backupSummary | Export-Csv -Path $backupSummaryFile -NoTypeInformation
-$backupSummaryHtml = $backupSummary | ConvertTo-Html -Fragment
-
-# Pivot for HTML: Capacity by Region & App (TiB)
-$pivotRows = @()
-$regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
-$apps    = $byRegionApp | Select-Object -ExpandProperty App    -Unique | Sort-Object
-foreach ($r in $regions) {
-  $row = [ordered]@{ Region = $r }
-  foreach ($a in $apps) {
-    $val = ($byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a } | Select-Object -ExpandProperty Size_TiB -ErrorAction SilentlyContinue)
-    if (-not $val) { $row[$a] = 0 } else { $row[$a] = [math]::Round(($val | Measure-Object -Sum).Sum, 3) }
-  }
-  $pivotRows += [pscustomobject]$row
-}
-$pivotHtml = $pivotRows | ConvertTo-Html -Fragment
+$backupSummaryHtml = $backupSummary | ConvertTo-Html -Property Region,Workload,Discovered,Protected,'% Protected','Protected Size TiB' -Fragment
 
 # Raw detail CSVs
 if ($AllVMs.Count)                { $AllVMs                | Export-Csv (Join-Path $OutputPath "azure_vms_$timestamp.csv") -NoTypeInformation }
@@ -764,18 +756,27 @@ $byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Frag
 $aggLevel = if ($AggregateStorageAtAccountLevel) { 'account' } else { 'service' }
 
 $byRegionApp = Import-Csv $byRegionFile
-$pivotRows = @()
+$pivotSizeRows = @(); $pivotCountRows = @()
 $regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
 $apps    = $byRegionApp | Select-Object -ExpandProperty App    -Unique | Sort-Object
 foreach ($r in $regions) {
-  $row = [ordered]@{ Region = $r }
+  $rowSize = [ordered]@{ Region = $r }
+  $rowCount = [ordered]@{ Region = $r }
   foreach ($a in $apps) {
-    $val = ($byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a } | Select-Object -ExpandProperty Size_TiB -ErrorAction SilentlyContinue)
-    if (-not $val) { $row[$a] = 0 } else { $row[$a] = [math]::Round(($val | Measure-Object -Sum).Sum, 3) }
+    $subset = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a }
+    if (-not $subset) {
+      $rowSize[$a] = 0
+      $rowCount[$a] = 0
+    } else {
+      $rowSize[$a] = [math]::Round(($subset | Measure-Object -Property Size_TiB -Sum).Sum, 3)
+      $rowCount[$a] = ($subset | Measure-Object -Property Count -Sum).Sum
+    }
   }
-  $pivotRows += [pscustomobject]$row
+  $pivotSizeRows += [pscustomobject]$rowSize
+  $pivotCountRows += [pscustomobject]$rowCount
 }
-$pivotHtml = $pivotRows | ConvertTo-Html -Fragment
+$pivotSizeHtml  = $pivotSizeRows  | ConvertTo-Html -Fragment
+$pivotCountHtml = $pivotCountRows | ConvertTo-Html -Fragment
 
 $topRegions = ($byRegionApp | Group-Object Region | ForEach-Object {
   [pscustomobject]@{
@@ -797,8 +798,10 @@ $byAppHtml
 <h2>Top Regions by Total Capacity</h2>
 $topRegionsHtml
 <h2>Capacity by Region & App (TiB)</h2>
-$pivotHtml
-<h2>Backup Protection (Discovered vs Protected)</h2>
+$pivotSizeHtml
+<h2>Resource Count by Region & App</h2>
+$pivotCountHtml
+<h2>Backup Protection by Region & Workload</h2>
 <p class="note">Counts marked with * indicate on-prem workloads.</p>
 $backupSummaryHtml
 </body></html>
