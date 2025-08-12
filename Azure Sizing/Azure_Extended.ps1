@@ -759,7 +759,7 @@ Add-Completeness -Workload 'Azure VM'                    -Discovered $AllVMs.Cou
 $__Unattached = ($AllManagedDisks | Where-Object { $_.IsAttached -eq $false })
 Add-Completeness -Workload 'Unattached Managed Disk'     -Discovered $__Unattached.Count          -WithSize ($__Unattached | Where-Object { $_.DiskSizeGB -gt 0 }).Count
 Add-Completeness -Workload 'Azure SQL DB'                -Discovered $AllSQLDatabases.Count       -WithSize ($AllSQLDatabases | Where-Object { $_.MaxSizeBytes -gt 0 }).Count
-Add-Completeness -Workload 'SQL Managed Instance'        -Discovered $AllSQLManagedInstances.Count- WithSize ($AllSQLManagedInstances | Where-Object { $_.StorageSizeInGB -gt 0 }).Count
+Add-Completeness -Workload 'SQL Managed Instance'        -Discovered $AllSQLManagedInstances.Count -WithSize ($AllSQLManagedInstances | Where-Object { $_.StorageSizeInGB -gt 0 }).Count
 Add-Completeness -Workload 'Storage Account'             -Discovered $AllStorageAccounts.Count    -WithSize $AllStorageAccounts.Count
 Add-Completeness -Workload 'Azure Files (per share)'     -Discovered $AllFileShares.Count         -WithSize $AllFileShares.Count
 Add-Completeness -Workload 'Table Storage'               -Discovered $AllTableStorage.Count       -WithSize $AllTableStorage.Count
