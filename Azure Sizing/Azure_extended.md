@@ -1,9 +1,3 @@
-Got it — I’ve restructured the README so the core usage and “quick starts” stay clean for most users, and all the more complex explanations you asked for (MG runs, metrics behavior, permissions nuance, throttling, ARG vs ARM, etc.) live in a clearly separated **Advanced Usage** section at the bottom.
-
-I’ve also explicitly called out which workloads are **skipped by default** and why, so it’s obvious without reading the script.
-
----
-
 # Azure Sizing Script — README
 
 ## Overview
