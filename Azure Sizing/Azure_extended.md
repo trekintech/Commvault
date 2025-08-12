@@ -1,173 +1,264 @@
-# Commvault Azure Sizing Information Collection Script
+Got it — I’ve restructured the README so the core usage and “quick starts” stay clean for most users, and all the more complex explanations you asked for (MG runs, metrics behavior, permissions nuance, throttling, ARG vs ARM, etc.) live in a clearly separated **Advanced Usage** section at the bottom.
+
+I’ve also explicitly called out which workloads are **skipped by default** and why, so it’s obvious without reading the script.
+
+---
+
+# Azure Sizing Script — README
 
 ## Overview
 
-This PowerShell script collects metadata and sizing information for supported Azure workloads to help with backup sizing and planning.  
-It works across **all Azure subscriptions** you have **Reader** access to by default, or can be restricted to specific subscriptions with the `-SubscriptionIds` parameter.
+This script collects Azure workload inventory and capacity for backup sizing with per-region breakdowns, **avoiding double-counting storage**.
 
-It collects and aggregates information for:
+### Discovered workloads:
 
-- Azure Virtual Machines and Managed Disks
-- Azure SQL Databases and Managed Instances
-- Azure Storage Accounts (Blob, Files, Table)
-- Azure Data Lake Storage Gen2 (if present in the account — see note below)
-- Azure Cosmos DB
-- Azure Databases for MySQL, MariaDB, and PostgreSQL
-- Azure Table Storage
-- Azure Backup–protected items
-
-> **Note on ADLS Gen2**  
-> ADLS Gen2 capacity is included in **Storage Account** totals if it exists, but the script does not explicitly label ADLS Gen2 usage separately.  
-> To confirm ADLS Gen2 use, you will need to check the storage account configuration directly.
+* **Azure VMs** (attached managed disks’ capacity attributed to VM; unattached disks listed separately)
+* **Azure SQL Databases** and **SQL Managed Instances**
+* **Storage Accounts** (per-service usage: Azure Files, Table Storage, Blob; ADLS Gen2 if HNS=true)
+* **Cosmos DB** (DataUsage + IndexUsage metrics)
+* **Azure Database for MySQL, MariaDB, PostgreSQL**
+* **Azure Backup** vaults, policies, and items
+* **Azure NetApp Files (ANF)** — **skipped by default** unless `Az.NetAppFiles` module available and `-SkipAzureNetAppFiles` is not set
+* **Oracle Database\@Azure** — **skipped by default** unless `Az.Oracle` module available and `-SkipOracleDatabase` is not set
 
 ---
 
-## Prerequisites
+## Requirements
 
-- **PowerShell 7.0+**
-- Az PowerShell modules:
-  - `Az.Accounts`
-  - `Az.Compute`
-  - `Az.Storage`
-  - `Az.Sql`
-  - `Az.SqlVirtualMachine`
-  - `Az.ResourceGraph`
-  - `Az.Monitor`
-  - `Az.Resources`
-  - `Az.RecoveryServices`
-  - `Az.CostManagement`
-  - `Az.CosmosDB`
-  - `Az.MySql`
-  - `Az.MariaDb`
-  - `Az.PostgreSql`
-  - `Az.Table`
+### PowerShell
 
-Install missing modules (example):
-```powershell
-Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CostManagement,Az.CosmosDB,Az.MySql,Az.MariaDb,Az.PostgreSql,Az.Table -Scope CurrentUser
-````
+* PowerShell 7+ (`pwsh`) — Azure Cloud Shell uses PowerShell 7 by default.
 
----
+### Required modules
 
-## Permissions Required
+The script checks and can auto-install these if `-AutoInstallModules` is used.
 
-* **Minimum**: Built-in `Reader` role at the **subscription scope** (sufficient for all default collection paths used by the script)
-* **Optional**: For the Azure Files **data-plane fallback** (used if metrics are unavailable), you will also need either:
+**Required:**
 
-  * The **Storage Blob Data Reader** role on the storage account, or
-  * Access via an account key or SAS token
+* Az.Accounts
+* Az.Compute
+* Az.Storage
+* Az.Sql
+* Az.SqlVirtualMachine
+* Az.ResourceGraph
+* Az.Monitor
+* Az.Resources
+
+**Optional:** (sections skipped if missing)
+
+* Az.RecoveryServices – Azure Backup
+* Az.CosmosDB – Cosmos DB
+* Az.MySql, Az.MariaDb, Az.PostgreSql – PaaS DB services
+* Az.NetAppFiles – Azure NetApp Files (**skipped by default if module not found**)
+* Az.Oracle – Oracle\@Azure (**skipped by default if module not found**)
 
 ---
 
-## How Subscriptions Are Handled
+## Permissions
 
-By default, the script queries **all subscriptions** you have `Reader` access to.
+### Minimum RBAC at scan scope
 
-To restrict to specific subscriptions:
+* **Reader** on the subscriptions or management groups being scanned
 
-```powershell
-.\Get-AzureSizingInfo.ps1 -SubscriptionIds "sub1","sub2"
-```
+### For metrics:
 
-Where `sub1` and `sub2` are Azure subscription GUIDs.
+* Reader includes `Microsoft.Insights/metrics/read`
+  Some orgs grant **Monitoring Reader** separately
 
----
+### For blob/container details (`-GetContainerDetails`):
 
-## Optional Parameters and Workflows
+* **Storage Blob Data Reader** (data-plane role) on each storage account
 
-### 1. Restrict to Specific Subscriptions
+### For Azure Backup:
 
-```powershell
-.\Get-AzureSizingInfo.ps1 -SubscriptionIds "11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222"
-```
+* **Backup Reader** on Recovery Services vaults
 
-### 2. Anonymise Resource Group and Object Names
+### For ANF / Oracle\@Azure:
 
-```powershell
-.\Get-AzureSizingInfo.ps1 -AnonymiseNames
-```
-
-Replaces resource group and object names with anonymised labels in the output.
-
-### 3. Output Formats
-
-By default, the script outputs tables in the console and saves CSV/HTML summaries.
-
-```powershell
-.\Get-AzureSizingInfo.ps1 -OutputPath "C:\Reports"
-```
+* **Reader** on those resources
 
 ---
 
-## How Capacity Is Counted
+## Scope & Defaults
 
-The script reports **Storage Account** capacity as an aggregate across services:
+By default (no scope flags), **all visible subscriptions** in your account are scanned.
 
-```
- ┌───────────────────────────┐
- │   Storage Account Total   │
- └──────────────┬────────────┘
-                │
-     ┌──────────┼──────────┬──────────┐
-     │          │          │          │
-   Blob       Files      Tables    (ADLS Gen2 if present)
-```
+Scope flags (choose one):
 
-* **Blob**: All blob container capacity in the account
-* **Files**: All SMB file shares in the account
-  (counted inside Storage Account total, not broken out separately in capacity totals unless the optional data-plane path is used)
-* **Tables**: Azure Table Storage capacity
-* **ADLS Gen2**: Counted inside the storage account total if enabled; not labelled separately in the output
+* `-AllSubscriptions` – explicit all visible subs (same as default)
+* `-CurrentSubscription`
+* `-Subscriptions <names or IDs>`
+* `-ManagementGroups <names or IDs>`
 
-> This means that the **Storage Account total already includes** capacity from Files, Blob, Table, and any ADLS Gen2 usage.
-> Individual workload tables (e.g. “Azure Files”) list object counts but will not show separate capacity unless the metrics API returns it for that service.
+> Only one scope selection method can be used per run.
 
 ---
 
-## Example Output Sections
+## Quick Starts
 
-### Workload Totals
-
-```
-App             Count Size_GiB Size_TiB
----             ----- -------- --------
-ADLS Gen2           1        0        0
-Azure Files         6        0        0
-Azure SQL DB        5      288    0.281
-Azure VM           28        0        0
-Cosmos DB           2        0        0
-Managed Disk       48     3850     3.76
-Storage Account    26   427.54    0.418
-Table Storage      26        0        0
-```
-
-### Top Regions (by TiB)
-
-```
-Region        Resources   TiB
-------        ---------   ---
-westeurope           61 2.319
-eastus2              29 1.276
-eastus               26 0.571
-australiaeast        12 0.154
-uksouth               2 0.124
-```
-
----
-
-## Example Full Run
+### Default — all visible subscriptions
 
 ```powershell
-# Default run against all subscriptions
-.\Get-AzureSizingInfo.ps1
+pwsh ./Get-AzureSizingInfo.ps1 -AutoInstallModules -OutputPath ./out
+```
 
-# Against specific subscriptions with anonymised names
-.\Get-AzureSizingInfo.ps1 -SubscriptionIds "sub1","sub2" -AnonymiseNames -OutputPath "C:\Reports"
+### Current subscription only
+
+```powershell
+pwsh ./Get-AzureSizingInfo.ps1 -CurrentSubscription -OutputPath ./out
+```
+
+### Explicit subscriptions
+
+```powershell
+pwsh ./Get-AzureSizingInfo.ps1 `
+  -Subscriptions "Prod-Sub","8b6d2e4a-1111-2222-3333-abcdef123456" `
+  -OutputPath ./out
+```
+
+### With anonymisation
+
+```powershell
+pwsh ./Get-AzureSizingInfo.ps1 `
+  -AllSubscriptions `
+  -AnonymizeScope Objects -AnonymizeSalt "my-salt" `
+  -OutputPath ./out
+```
+
+### Aggregate storage totals for speed
+
+```powershell
+pwsh ./Get-AzureSizingInfo.ps1 `
+  -AggregateStorageAtAccountLevel `
+  -OutputPath ./out
 ```
 
 ---
 
-## Notes
+## Main Flags
 
-* Some storage service capacities (Azure Files, Table, ADLS Gen2) may return `0` if metrics are not enabled or supported in that region/SKU.
-* If Azure Files capacity is critical for your sizing, ensure **Storage metrics** are enabled, or grant **Storage Blob Data Reader** permissions for the optional data-plane query.
+Workload skipping:
+
+* `-SkipAzureVMandManagedDisks`
+* `-SkipAzureSQLandManagedInstances`
+* `-SkipAzureStorageAccounts`
+* `-SkipAzureBackup`
+* `-SkipAzureCosmosDB`
+* `-SkipAzureDataLake`
+* `-SkipAzureDatabaseServices`
+* `-SkipOracleDatabase`
+* `-SkipAzureNetAppFiles`
+
+Storage handling:
+
+* `-AggregateStorageAtAccountLevel` – skip service-level breakdown
+* `-GetContainerDetails` – deep per-container scan (slower; needs Storage Blob Data Reader)
+
+Modules & anonymisation:
+
+* `-AutoInstallModules`
+* `-AnonymizeScope None|ResourceGroups|Objects|All`
+* `-AnonymizeSalt "<string>"`
+
+Optional module prompts:
+
+* `-PromptInstallOracle`
+* `-PromptInstallNetApp`
+
+---
+
+## Outputs
+
+All outputs are timestamped `yyyyMMdd_HHmmss` and written to `-OutputPath`.
+
+Summary CSVs:
+
+* `azure_sizing_by_app_<ts>.csv`
+* `azure_sizing_by_region_<ts>.csv`
+
+Per-service CSVs:
+
+* VMs, managed disks, SQL DBs, storage accounts, blob containers (if `-GetContainerDetails`), file shares, Cosmos DB, ADLS Gen2, PaaS DBs, ANF (if enabled), Oracle DBs (if enabled), Azure Backup vaults/policies/items
+
+HTML report:
+
+* `azure_sizing_report_<ts>.html` — formatted summary of all collected data
+
+---
+
+## Storage Account Hierarchy in Reports
+
+```
+Storage Account Total
+ └─ ADLS Gen2
+ └─ Azure Files
+ └─ Blob
+ └─ Table Storage
+```
+
+Rules:
+
+* HNS=true → blob capacity attributed to ADLS Gen2, not Blob
+* Blob capacity → from Azure Monitor; fallback to per-container sum if `-GetContainerDetails`
+* No double-counting between ADLS Gen2 and Blob in aggregates
+
+---
+
+## **Advanced Usage**
+
+### Running via Management Groups
+
+Use `-ManagementGroups <names or IDs>` to scan all subscriptions under one or more MGs.
+
+Example:
+
+```powershell
+pwsh ./Get-AzureSizingInfo.ps1 `
+  -ManagementGroups "corp-root","uk-landing-zones" `
+  -SkipOracleDatabase -SkipAzureNetAppFiles `
+  -OutputPath ./out
+```
+
+**Permissions needed:**
+
+* Reader at MG scope (to list subscriptions)
+* Same per-resource permissions as subscription scans
+
+**Performance tips:**
+
+* For huge estates, use `-AggregateStorageAtAccountLevel`
+* Skip low-value workloads with `-SkipAzureNetAppFiles` or `-SkipOracleDatabase`
+* Avoid `-GetContainerDetails` unless necessary
+
+---
+
+### Metrics behavior
+
+* BlobCapacity/TableCapacity metrics can lag by \~1–2 hours
+* Script always uses the most recent metric in the last 1–2 days
+* If metric unavailable and `-GetContainerDetails` is set, falls back to blob enumeration
+
+---
+
+### Optional modules skipped by default
+
+* **Az.Oracle** (Oracle\@Azure)
+* **Az.NetAppFiles** (Azure NetApp Files)
+
+These are **not loaded or installed automatically** unless:
+
+* You use `-AutoInstallModules` **and** do not pass the skip flag
+* Or you pass `-PromptInstallOracle` / `-PromptInstallNetApp` and accept the prompt
+
+---
+
+### On-Prem backup workloads
+
+In the **Backup Protection** table:
+
+* Asterisks `*` indicate on-prem workloads (`MAB`, `AzureBackupServer`, `DPM`, `SystemCenterDPM`)
+* Azure Files is **not** on-prem and will never be starred
+
+---
+
+Do you want me to now give you a **full dependency/feature matrix** so users can see exactly which flags, modules, and RBAC are required for each workload? That would make the advanced section even more complete.
