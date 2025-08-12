@@ -9,25 +9,25 @@ Collects Azure workload inventory and capacity for backup sizing with regional b
 Discovers and sizes:
 - Azure VMs (count) and Managed Disks (capacity)
 - Azure SQL Databases and SQL Managed Instances
-- Storage Accounts (detail only), Azure Files (per share via ARM Get-AzRmStorageShare -GetShareUsage), Table Storage (service metric), Blob Containers (optional)
-- ADLS Gen2 (detail only; capacity not double-counted)
+- Storage Accounts (detail only), Azure Files (per share via ARM Get-AzRmStorageShare -GetShareUsage), Table Storage (service metric), Blob (service metric; per-container optional)
+- ADLS Gen2 (shown as child of Storage Accounts; capacity derived from blob service when HNS=true)
 - Cosmos DB (DataUsage + IndexUsage)
 - Azure Database for MySQL/MariaDB/PostgreSQL
 - Azure NetApp Files (volumes via Az.NetAppFiles)
 - Optional: Oracle Database@Azure (install/prompt supported)
 - Optional: Azure Backup (vaults, policies, items)
 
-Key behavior (per your requirements)
+Key behavior
 - Capacity of ATTACHED managed disks is attributed to the owning VM (VM totals/regions).
-- Only UNATTACHED disks appear as a separate workload line: “Unattached Managed Disk”.
-- In Azure Backup summary, an asterisk (*) appears only when protection items are from on-prem agents
-  (MAB / AzureBackupServer / DPM / SystemCenterDPM). Azure Files is NOT marked on-prem.
+- Only UNATTACHED disks appear as a separate workload line: “Unattached Disks”.
+- Storage summaries show a parent “Storage Account Total” with children “ADLS Gen2”, “Azure Files”, “Blob”, “Table Storage”.
+- Blob capacity uses the Azure Monitor metric “BlobCapacity”. If unavailable and -GetContainerDetails is set, falls back to summing container sizes for that account.
 
 Outputs
 - Per-app totals (Count, GiB, TiB)
 - Per-region/per-app breakdowns (Count, GiB, TiB) with no storage duplication
-- HTML summary with totals + “Capacity by Region & App” + Data Completeness + Azure Files (per-share) overview
-- Raw detail CSVs (all include TiB columns to 3dp)
+- HTML summary with totals + “Capacity by Region & App” (with Storage Account Total hierarchy) + Data Completeness + Azure Files (per-share) overview
+- Raw detail CSVs (always created; empty files will contain only headers)
 
 Anonymisation (optional)
 - -AnonymizeScope None|ResourceGroups|Objects|All (default None)
@@ -76,12 +76,12 @@ param (
   [switch]$PromptInstallNetApp,
 
   # Storage aggregation control:
-  #   Default (false) = service-level breakout (Files/Tables/Blobs). No storage-account aggregation -> no double count.
+  #   Default (false) = service-level breakout (Files/Tables/Blob/ADLS). No storage-account aggregation -> no double count.
   #   True = account-level only (aggregate whole account, skip per-service adds).
   [switch]$AggregateStorageAtAccountLevel
 )
 
-$ScriptVersion = "3.6.0"
+$ScriptVersion = "3.7.1"
 Write-Host "`n[INFO] Azure Sizing Script v$ScriptVersion" -ForegroundColor Green
 
 # Quiet deprecation spam from Get-AzMetric
@@ -165,6 +165,24 @@ function Add-Aggregate {
 }
 function New-List { New-Object System.Collections.ArrayList }
 function Add-ListItem { param([System.Collections.ArrayList]$List,[object]$Item) [void]$List.Add($Item) }
+
+# Always create CSVs (headers-only when empty)
+function Export-AlwaysCsv {
+  param(
+    [Parameter(Mandatory)] [System.Collections.IEnumerable] $Data,
+    [Parameter(Mandatory)] [string] $Path,
+    [Parameter(Mandatory)] [string[]] $Headers
+  )
+  try {
+    if ($Data -and ($Data.Count -gt 0)) {
+      $Data | Export-Csv -Path $Path -NoTypeInformation
+    } else {
+      Set-Content -Path $Path -Value ($Headers -join ',')
+    }
+  } catch {
+    Write-Host "[WARN] Failed to write $Path`: $_" -ForegroundColor Yellow
+  }
+}
 
 # ===== metrics helper =====
 function Get-MetricBytes {
@@ -380,7 +398,7 @@ function Collect-VMs-And-Disks {
       }
     } else {
       # Unattached disk contributes to its own workload line
-      Add-Aggregate -Map $Aggregates -App 'Unattached Managed Disk' -Region $loc -SizeBytes $sizeBytes
+      Add-Aggregate -Map $Aggregates -App 'Unattached Disks' -Region $loc -SizeBytes $sizeBytes
     }
 
     Add-ListItem -List $AllManagedDisks -Item ([pscustomobject]@{
@@ -432,6 +450,8 @@ function Collect-Storage {
   $sas = Get-AzStorageAccount -ErrorAction SilentlyContinue
   foreach ($sa in $sas) {
     $loc = Normalize-Location $sa.Location
+
+    # Account-level used capacity (informational)
     $acctBytes = Get-MetricBytes -ResourceId $sa.Id -MetricName 'UsedCapacity' -MetricNamespace 'Microsoft.Storage/storageAccounts' -Days 2
 
     # Always collect detail row for the storage account (detail only; not aggregated unless -AggregateStorageAtAccountLevel)
@@ -445,16 +465,12 @@ function Collect-Storage {
       continue
     }
 
-    # ADLS Gen2: detail only; count tracked separately (size visible at account level to avoid double counting)
-    if ($sa.EnableHierarchicalNamespace) {
-      Add-ListItem -List $AllDataLakeGen2 -Item ([pscustomobject]@{
-        SubscriptionId=$SubId; ResourceGroup=(Anon-RG $sa.ResourceGroupName); StorageAccountName=(Anon-Obj $sa.StorageAccountName 'stg-');
-        Location=$loc; UsedBytes=$acctBytes; Used_TiB=[math]::Round(($acctBytes/1TB),3)
-      })
-      Add-Aggregate -Map $Aggregates -App 'ADLS Gen2' -Region $loc -SizeBytes 0
-    }
+    # Blob service capacity via metric (preferred)
+    $blobSvcId = "$($sa.Id)/blobServices/default"
+    $blobBytes = Get-MetricBytes -ResourceId $blobSvcId -MetricName 'BlobCapacity' -MetricNamespace 'Microsoft.Storage/storageAccounts/blobServices' -Days 2
+    $blobBytesFromContainers = 0.0
 
-    # Azure Files (per share) — ARM method (Rubrik style): Get-AzRmStorageShare -GetShareUsage
+    # Azure Files (per share) — ARM method: Get-AzRmStorageShare -GetShareUsage
     try {
       $rmShares = Get-AzRmStorageShare -ResourceGroupName $sa.ResourceGroupName -StorageAccountName $sa.StorageAccountName -GetShareUsage -ErrorAction SilentlyContinue
       foreach ($sh in $rmShares) {
@@ -481,7 +497,7 @@ function Collect-Storage {
       Add-Aggregate -Map $Aggregates -App 'Table Storage' -Region $loc -SizeBytes $tableBytes
     }
 
-    # Blob containers (optional deep)
+    # Blob containers (optional deep details for CSV; NOT added to aggregates to avoid double counting)
     if ($GetContainerDetails) {
       try {
         $ctx = $sa.Context
@@ -492,14 +508,32 @@ function Collect-Storage {
             $blobs = Get-AzStorageBlob -Container $c.Name -Context $ctx -ErrorAction SilentlyContinue
             if ($blobs) { $sumBytes = ($blobs | Measure-Object -Property Length -Sum).Sum }
           } catch {}
+          $blobBytesFromContainers += [double]$sumBytes
           Add-ListItem -List $AllBlobContainers -Item ([pscustomobject]@{
             SubscriptionId=$SubId; ResourceGroup=(Anon-RG $sa.ResourceGroupName); StorageAccountName=(Anon-Obj $sa.StorageAccountName 'stg-');
             ContainerName=(Anon-Obj $c.Name 'cont-'); Location=$loc; UsedBytes=$sumBytes; Used_TiB=[math]::Round(($sumBytes/1TB),3)
           })
-          Add-Aggregate -Map $Aggregates -App 'Blob Container' -Region $loc -SizeBytes $sumBytes
         }
       } catch {
         Write-Host "    [WARN] Could not access blob containers for $($sa.StorageAccountName)" -ForegroundColor Yellow
+      }
+    }
+
+    # If BlobCapacity metric was zero/unavailable but we have container detail, use that
+    if ($blobBytes -le 0 -and $blobBytesFromContainers -gt 0) { $blobBytes = $blobBytesFromContainers }
+
+    # ADLS vs Blob attribution (avoid double counting)
+    if ($sa.EnableHierarchicalNamespace) {
+      # Treat all blob capacity as ADLS Gen2 for HNS accounts
+      Add-ListItem -List $AllDataLakeGen2 -Item ([pscustomobject]@{
+        SubscriptionId=$SubId; ResourceGroup=(Anon-RG $sa.ResourceGroupName); StorageAccountName=(Anon-Obj $sa.StorageAccountName 'stg-');
+        Location=$loc; UsedBytes=$blobBytes; Used_TiB=[math]::Round(($blobBytes/1TB),3)
+      })
+      Add-Aggregate -Map $Aggregates -App 'ADLS Gen2' -Region $loc -SizeBytes $blobBytes
+    } else {
+      # Regular blob storage
+      if ($blobBytes -gt 0) {
+        Add-Aggregate -Map $Aggregates -App 'Blob' -Region $loc -SizeBytes $blobBytes
       }
     }
   }
@@ -681,21 +715,58 @@ foreach ($kv in $Aggregates.GetEnumerator()) { $rec = $kv.Value; Bump-AppTotals 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not (Test-Path $OutputPath)) { New-Item -Path $OutputPath -ItemType Directory | Out-Null }
 
-# Per-app totals
-$byApp = foreach ($v in ($TotalsByApp.Values | Sort-Object App)) {
+# Per-app totals (base)
+$byAppBase = foreach ($v in ($TotalsByApp.Values | Sort-Object App)) {
   $conv = Convert-Bytes $v.Bytes
   [pscustomobject]@{ App=$v.App; Count=$v.Count; Size_GiB=$conv.GiB; Size_TiB=$conv.TiB }
 }
-$byAppFile = Join-Path $OutputPath "azure_sizing_by_app_$timestamp.csv"
-$byApp | Export-Csv -Path $byAppFile -NoTypeInformation
 
-# Per-region per-app
-$byRegionApp = foreach ($v in ($Aggregates.Values | Sort-Object Region,App)) {
+# Create hierarchical Storage Account Total summary for display (CSV remains base)
+function Get-AppTotal { param($app) $byAppBase | Where-Object { $_.App -eq $app } | Select-Object -First 1 }
+$totADLS  = Get-AppTotal 'ADLS Gen2'
+$totFiles = Get-AppTotal 'Azure Files'
+$totBlob  = Get-AppTotal 'Blob'
+$totTable = Get-AppTotal 'Table Storage'
+
+if ($null -ne $totADLS)  { $valADLS  = $totADLS }  else { $valADLS  = [pscustomobject]@{App='ADLS Gen2';Count=0;Size_GiB=0;Size_TiB=0} }
+if ($null -ne $totFiles) { $valFiles = $totFiles } else { $valFiles = [pscustomobject]@{App='Azure Files';Count=0;Size_GiB=0;Size_TiB=0} }
+if ($null -ne $totBlob)  { $valBlob  = $totBlob }  else { $valBlob  = [pscustomobject]@{App='Blob';Count=0;Size_GiB=0;Size_TiB=0} }
+if ($null -ne $totTable) { $valTable = $totTable } else { $valTable = [pscustomobject]@{App='Table Storage';Count=0;Size_GiB=0;Size_TiB=0} }
+
+$saTotal = [pscustomobject]@{
+  App      = 'Storage Account Total'
+  Count    = ($valADLS.Count + $valFiles.Count + $valBlob.Count + $valTable.Count)
+  Size_GiB = [math]::Round(($valADLS.Size_GiB + $valFiles.Size_GiB + $valBlob.Size_GiB + $valTable.Size_GiB),2)
+  Size_TiB = [math]::Round(($valADLS.Size_TiB + $valFiles.Size_TiB + $valBlob.Size_TiB + $valTable.Size_TiB),3)
+}
+
+# Build display list:
+$nonStorageApps = $byAppBase | Where-Object { $_.App -notin @('ADLS Gen2','Azure Files','Blob','Table Storage') }
+$nonStorageApps = $nonStorageApps | ForEach-Object {
+  if ($_.App -eq 'Unattached Disks') { $_ }
+  elseif ($_.App -eq 'Unattached Managed Disk') { $_.App = 'Unattached Disks'; $_ }
+  else { $_ }
+}
+
+$byAppDisplay = @()
+$byAppDisplay += $nonStorageApps | Sort-Object App
+$byAppDisplay += $saTotal
+$byAppDisplay += [pscustomobject]@{ App=' └─ ADLS Gen2'; Count=$valADLS.Count; Size_GiB=$valADLS.Size_GiB; Size_TiB=$valADLS.Size_TiB }
+$byAppDisplay += [pscustomobject]@{ App=' └─ Azure Files'; Count=$valFiles.Count; Size_GiB=$valFiles.Size_GiB; Size_TiB=$valFiles.Size_TiB }
+$byAppDisplay += [pscustomobject]@{ App=' └─ Blob'; Count=$valBlob.Count; Size_GiB=$valBlob.Size_GiB; Size_TiB=$valBlob.Size_TiB }
+$byAppDisplay += [pscustomobject]@{ App=' └─ Table Storage'; Count=$valTable.Count; Size_GiB=$valTable.Size_GiB; Size_TiB=$valTable.Size_TiB }
+
+# Persist the original base CSV (unchanged as requested)
+$byAppFile = Join-Path $OutputPath "azure_sizing_by_app_$timestamp.csv"
+$byAppBase | Export-Csv -Path $byAppFile -NoTypeInformation
+
+# Per-region per-app (base)
+$byRegionAppBase = foreach ($v in ($Aggregates.Values | Sort-Object Region,App)) {
   $conv = Convert-Bytes $v.Bytes
   [pscustomobject]@{ Region=$v.Region; App=$v.App; Count=$v.Count; Size_GiB=$conv.GiB; Size_TiB=$conv.TiB }
 }
 $byRegionFile = Join-Path $OutputPath "azure_sizing_by_region_$timestamp.csv"
-$byRegionApp | Export-Csv -Path $byRegionFile -NoTypeInformation
+$byRegionAppBase | Export-Csv -Path $byRegionFile -NoTypeInformation
 
 # ----- Backup protection counts (asterisk only for *on-prem* agents) -----
 $protectedCounts = @{}
@@ -713,7 +784,7 @@ foreach ($b in $AllBackupItems) {
 }
 
 # Discovery vs protection summary with size estimates
-$backupSummary = foreach ($rec in $byRegionApp) {
+$backupSummary = foreach ($rec in $byRegionAppBase) {
   $key = "$($rec.App)|$($rec.Region)"
   $protCount = 0
   $onPrem = $false
@@ -755,15 +826,13 @@ function Add-Completeness {
 }
 
 Add-Completeness -Workload 'Azure VM'                    -Discovered $AllVMs.Count                -WithSize $AllVMs.Count
-# Unattached only (attached capacity now lives under Azure VM)
-$__Unattached = ($AllManagedDisks | Where-Object { $_.IsAttached -eq $false })
-Add-Completeness -Workload 'Unattached Managed Disk'     -Discovered $__Unattached.Count          -WithSize ($__Unattached | Where-Object { $_.DiskSizeGB -gt 0 }).Count
+Add-Completeness -Workload 'Unattached Disks'            -Discovered (($AllManagedDisks | Where-Object { -not $_.IsAttached }).Count) -WithSize (($AllManagedDisks | Where-Object { -not $_.IsAttached -and $_.DiskSizeGB -gt 0 }).Count)
 Add-Completeness -Workload 'Azure SQL DB'                -Discovered $AllSQLDatabases.Count       -WithSize ($AllSQLDatabases | Where-Object { $_.MaxSizeBytes -gt 0 }).Count
 Add-Completeness -Workload 'SQL Managed Instance'        -Discovered $AllSQLManagedInstances.Count -WithSize ($AllSQLManagedInstances | Where-Object { $_.StorageSizeInGB -gt 0 }).Count
 Add-Completeness -Workload 'Storage Account'             -Discovered $AllStorageAccounts.Count    -WithSize $AllStorageAccounts.Count
 Add-Completeness -Workload 'Azure Files (per share)'     -Discovered $AllFileShares.Count         -WithSize $AllFileShares.Count
 Add-Completeness -Workload 'Table Storage'               -Discovered $AllTableStorage.Count       -WithSize $AllTableStorage.Count
-Add-Completeness -Workload 'Blob Container'              -Discovered $AllBlobContainers.Count     -WithSize $AllBlobContainers.Count
+Add-Completeness -Workload 'Blob (service)'              -Discovered ($AllStorageAccounts.Count)  -WithSize ($AllStorageAccounts.Count)
 Add-Completeness -Workload 'ADLS Gen2 (accounts)'        -Discovered $AllDataLakeGen2.Count       -WithSize $AllDataLakeGen2.Count
 Add-Completeness -Workload 'Cosmos DB'                   -Discovered $AllCosmosDBAccounts.Count   -WithSize $AllCosmosDBAccounts.Count
 Add-Completeness -Workload 'Azure NetApp Files'          -Discovered $AllNetAppVolumes.Count      -WithSize $AllNetAppVolumes.Count
@@ -773,27 +842,27 @@ $completenessFile = Join-Path $OutputPath "azure_data_completeness_$timestamp.cs
 $Completeness | Export-Csv -Path $completenessFile -NoTypeInformation
 $completenessHtml = $Completeness | ConvertTo-Html -Property Workload,Discovered,WithSize,'Completeness %' -Fragment
 
-# Raw detail CSVs (all include TiB columns)
-if ($AllVMs.Count)                { $AllVMs                | Export-Csv (Join-Path $OutputPath "azure_vms_$timestamp.csv") -NoTypeInformation }
-if ($AllManagedDisks.Count)       { $AllManagedDisks       | Export-Csv (Join-Path $OutputPath "azure_managed_disks_$timestamp.csv") -NoTypeInformation }
-if ($AllSQLDatabases.Count)       { $AllSQLDatabases       | Export-Csv (Join-Path $OutputPath "azure_sql_databases_$timestamp.csv") -NoTypeInformation }
-if ($AllSQLManagedInstances.Count){ $AllSQLManagedInstances| Export-Csv (Join-Path $OutputPath "azure_sql_managed_instances_$timestamp.csv") -NoTypeInformation }
-if ($AllStorageAccounts.Count)    { $AllStorageAccounts    | Export-Csv (Join-Path $OutputPath "azure_storage_accounts_$timestamp.csv") -NoTypeInformation }
-if ($AllBlobContainers.Count)     { $AllBlobContainers     | Export-Csv (Join-Path $OutputPath "azure_blob_containers_$timestamp.csv") -NoTypeInformation }
-if ($AllFileShares.Count)         { $AllFileShares         | Export-Csv (Join-Path $OutputPath "azure_file_shares_$timestamp.csv") -NoTypeInformation }
-if ($AllCosmosDBAccounts.Count)   { $AllCosmosDBAccounts   | Export-Csv (Join-Path $OutputPath "azure_cosmosdb_accounts_$timestamp.csv") -NoTypeInformation }
-if ($AllDataLakeGen2.Count)       { $AllDataLakeGen2       | Export-Csv (Join-Path $OutputPath "azure_datalake_gen2_$timestamp.csv") -NoTypeInformation }
-if ($AllMariaDBServers.Count)     { $AllMariaDBServers     | Export-Csv (Join-Path $OutputPath "azure_mariadb_servers_$timestamp.csv") -NoTypeInformation }
-if ($AllMySQLServers.Count)       { $AllMySQLServers       | Export-Csv (Join-Path $OutputPath "azure_mysql_servers_$timestamp.csv") -NoTypeInformation }
-if ($AllPostgreSQLServers.Count)  { $AllPostgreSQLServers  | Export-Csv (Join-Path $OutputPath "azure_postgresql_servers_$timestamp.csv") -NoTypeInformation }
-if ($AllTableStorage.Count)       { $AllTableStorage       | Export-Csv (Join-Path $OutputPath "azure_table_storage_$timestamp.csv") -NoTypeInformation }
-if ($AllOracleDBs.Count)          { $AllOracleDBs          | Export-Csv (Join-Path $OutputPath "azure_oracle_databases_$timestamp.csv") -NoTypeInformation }
-if ($AllBackupVaults.Count)       { $AllBackupVaults       | Export-Csv (Join-Path $OutputPath "azure_backup_vaults_$timestamp.csv") -NoTypeInformation }
-if ($AllBackupPolicies.Count)     { $AllBackupPolicies     | Export-Csv (Join-Path $OutputPath "azure_backup_policies_$timestamp.csv") -NoTypeInformation }
-if ($AllBackupItems.Count)        { $AllBackupItems        | Export-Csv (Join-Path $OutputPath "azure_backup_items_$timestamp.csv") -NoTypeInformation }
-if ($AllNetAppVolumes.Count)      { $AllNetAppVolumes      | Export-Csv (Join-Path $OutputPath "azure_netapp_volumes_$timestamp.csv") -NoTypeInformation }
+# -------- Always write per-service CSVs (headers even if empty) --------
+Export-AlwaysCsv -Data $AllVMs                -Path (Join-Path $OutputPath "azure_vms_$timestamp.csv")                   -Headers @('SubscriptionId','ResourceGroup','Name','Location','VmSize','DiskCount','TotalDiskBytes','TotalDisk_GiB','TotalDisk_TiB')
+Export-AlwaysCsv -Data $AllManagedDisks       -Path (Join-Path $OutputPath "azure_managed_disks_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','Name','Location','Sku','DiskSizeGB','DiskSize_TiB','AttachedTo','IsAttached')
+Export-AlwaysCsv -Data $AllSQLDatabases       -Path (Join-Path $OutputPath "azure_sql_databases_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','ServerName','DatabaseName','Location','MaxSizeBytes','MaxSize_TiB')
+Export-AlwaysCsv -Data $AllSQLManagedInstances-Path (Join-Path $OutputPath "azure_sql_managed_instances_$timestamp.csv") -Headers @('SubscriptionId','ResourceGroup','Name','Location','StorageSizeInGB','StorageSize_TiB')
+Export-AlwaysCsv -Data $AllStorageAccounts    -Path (Join-Path $OutputPath "azure_storage_accounts_$timestamp.csv")      -Headers @('SubscriptionId','ResourceGroup','StorageAccountName','Location','Kind','Sku','UsedBytes','Used_TiB','Hns')
+Export-AlwaysCsv -Data $AllBlobContainers     -Path (Join-Path $OutputPath "azure_blob_containers_$timestamp.csv")       -Headers @('SubscriptionId','ResourceGroup','StorageAccountName','ContainerName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllFileShares         -Path (Join-Path $OutputPath "azure_file_shares_$timestamp.csv")           -Headers @('SubscriptionId','ResourceGroup','StorageAccountName','ShareName','Location','QuotaGiB','Quota_TiB','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllCosmosDBAccounts   -Path (Join-Path $OutputPath "azure_cosmosdb_accounts_$timestamp.csv")     -Headers @('SubscriptionId','ResourceGroup','AccountName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllDataLakeGen2       -Path (Join-Path $OutputPath "azure_datalake_gen2_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','StorageAccountName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllMariaDBServers     -Path (Join-Path $OutputPath "azure_mariadb_servers_$timestamp.csv")       -Headers @('SubscriptionId','ResourceGroup','ServerName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllMySQLServers       -Path (Join-Path $OutputPath "azure_mysql_servers_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','ServerName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllPostgreSQLServers  -Path (Join-Path $OutputPath "azure_postgresql_servers_$timestamp.csv")    -Headers @('SubscriptionId','ResourceGroup','ServerName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllTableStorage       -Path (Join-Path $OutputPath "azure_table_storage_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','StorageAccountName','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllOracleDBs          -Path (Join-Path $OutputPath "azure_oracle_databases_$timestamp.csv")      -Headers @('SubscriptionId','ResourceGroup','Name','Location','UsedBytes','Used_TiB')
+Export-AlwaysCsv -Data $AllBackupVaults       -Path (Join-Path $OutputPath "azure_backup_vaults_$timestamp.csv")         -Headers @('SubscriptionId','ResourceGroup','VaultName','Location')
+Export-AlwaysCsv -Data $AllBackupPolicies     -Path (Join-Path $OutputPath "azure_backup_policies_$timestamp.csv")       -Headers @('SubscriptionId','VaultName','PolicyName','WorkloadType','BackupManagementType')
+Export-AlwaysCsv -Data $AllBackupItems        -Path (Join-Path $OutputPath "azure_backup_items_$timestamp.csv")          -Headers @('SubscriptionId','VaultName','Location','WorkloadType','BackupManagementType','ProtectionState','LastBackupTime')
+Export-AlwaysCsv -Data $AllNetAppVolumes      -Path (Join-Path $OutputPath "azure_netapp_volumes_$timestamp.csv")        -Headers @('SubscriptionId','ResourceGroup','Account','CapacityPool','Volume','Protocol','Location','QuotaBytes','Quota_TiB')
 
-# HTML Summary
+# ----------------- HTML Summary -----------------
 $css = @"
 <style>
 body { font-family: Segoe UI, Arial, sans-serif; margin:20px; }
@@ -807,34 +876,74 @@ tr:nth-child(even) { background: #fafafa; }
 "@
 $totalGiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1GB, 2)
 $totalTiB = [math]::Round(($TotalsByApp.Values | Measure-Object -Property Bytes -Sum).Sum / 1TB, 3)
-$byAppHtml = $byApp | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
+$byAppHtml = $byAppDisplay | ConvertTo-Html -Property App,Count,Size_GiB,Size_TiB -Fragment
 
 $aggLevel = if ($AggregateStorageAtAccountLevel) { 'account' } else { 'service' }
 
 $byRegionApp = Import-Csv $byRegionFile
-$pivotSizeRows = @(); $pivotCountRows = @()
+$byRegionApp = $byRegionApp | ForEach-Object {
+  if ($_.App -eq 'Unattached Managed Disk') { $_.App = 'Unattached Disks' }
+  elseif ($_.App -eq 'Blob Container') { $_.App = 'Blob' }
+  $_
+}
+
 $regions = $byRegionApp | Select-Object -ExpandProperty Region -Unique | Sort-Object
-$apps    = $byRegionApp | Select-Object -ExpandProperty App    -Unique | Sort-Object
+$storageChildren = @('ADLS Gen2','Azure Files','Blob','Table Storage')
+
+$appsNonStorage = ($byRegionApp | Where-Object { $_.App -notin $storageChildren } | Select-Object -ExpandProperty App -Unique | Sort-Object)
+$appsDisplay = @()
+$appsDisplay += $appsNonStorage
+$appsDisplay += 'Storage Account Total',' └─ ADLS Gen2',' └─ Azure Files',' └─ Blob',' └─ Table Storage'
+
+$pivotSizeRows  = @()
+$pivotCountRows = @()
 foreach ($r in $regions) {
-  $rowSize = [ordered]@{ Region = $r }
+  $rowSize  = [ordered]@{ Region = $r }
   $rowCount = [ordered]@{ Region = $r }
-  foreach ($a in $apps) {
+
+  foreach ($a in $appsNonStorage) {
     $subset = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq $a }
-    if (-not $subset) {
-      $rowSize[$a] = 0
-      $rowCount[$a] = 0
-    } else {
-      $rowSize[$a] = [math]::Round(($subset | Measure-Object -Property Size_TiB -Sum).Sum, 3)
-      $rowCount[$a] = ($subset | Measure-Object -Property Count -Sum).Sum
-    }
+    $rowSize[$a]  = [math]::Round((($subset | Measure-Object -Property Size_TiB -Sum).Sum), 3)
+    $rowCount[$a] = ($subset | Measure-Object -Property Count -Sum).Sum
   }
-  $pivotSizeRows += [pscustomobject]$rowSize
+
+  $adls  = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq 'ADLS Gen2' }
+  $files = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq 'Azure Files' }
+  $blob  = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq 'Blob' }
+  $table = $byRegionApp | Where-Object { $_.Region -eq $r -and $_.App -eq 'Table Storage' }
+
+  $adlsSize  = [math]::Round((($adls  | Measure-Object -Property Size_TiB -Sum).Sum),3)
+  $filesSize = [math]::Round((($files | Measure-Object -Property Size_TiB -Sum).Sum),3)
+  $blobSize  = [math]::Round((($blob  | Measure-Object -Property Size_TiB -Sum).Sum),3)
+  $tableSize = [math]::Round((($table | Measure-Object -Property Size_TiB -Sum).Sum),3)
+
+  $adlsCount  = ($adls  | Measure-Object -Property Count -Sum).Sum
+  $filesCount = ($files | Measure-Object -Property Count -Sum).Sum
+  $blobCount  = ($blob  | Measure-Object -Property Count -Sum).Sum
+  $tableCount = ($table | Measure-Object -Property Count -Sum).Sum
+
+  $saSize  = [math]::Round(($adlsSize + $filesSize + $blobSize + $tableSize),3)
+  $saCount = ($adlsCount + $filesCount + $blobCount + $tableCount)
+
+  $rowSize['Storage Account Total']  = $saSize
+  $rowCount['Storage Account Total'] = $saCount
+  $rowSize[' └─ ADLS Gen2']          = $adlsSize
+  $rowCount[' └─ ADLS Gen2']         = $adlsCount
+  $rowSize[' └─ Azure Files']        = $filesSize
+  $rowCount[' └─ Azure Files']       = $filesCount
+  $rowSize[' └─ Blob']               = $blobSize
+  $rowCount[' └─ Blob']              = $blobCount
+  $rowSize[' └─ Table Storage']      = $tableSize
+  $rowCount[' └─ Table Storage']     = $tableCount
+
+  $pivotSizeRows  += [pscustomobject]$rowSize
   $pivotCountRows += [pscustomobject]$rowCount
 }
+
 $pivotSizeHtml  = $pivotSizeRows  | ConvertTo-Html -Fragment
 $pivotCountHtml = $pivotCountRows | ConvertTo-Html -Fragment
 
-$topRegions = ($byRegionApp | Group-Object Region | ForEach-Object {
+$topRegions = ($byRegionAppBase | Group-Object Region | ForEach-Object {
   [pscustomobject]@{
     Region = $_.Name
     Resources = ($_.Group | Measure-Object -Property Count -Sum).Sum
@@ -843,7 +952,6 @@ $topRegions = ($byRegionApp | Group-Object Region | ForEach-Object {
 } | Sort-Object TiB -Descending | Select-Object -First 10)
 $topRegionsHtml = $topRegions | ConvertTo-Html -Property Region,Resources,TiB -Fragment
 
-# Azure Files - Shares by Region (count, TiB)
 $filesByRegion = $AllFileShares | Group-Object Location | ForEach-Object {
   [pscustomobject]@{
     Region = $_.Name
@@ -860,7 +968,7 @@ $report = @"
 <p>Generated: $(Get-Date)</p>
 <h2>Totals by App</h2>
 $byAppHtml
-<p class="note">Sizes shown in GiB/TiB (1024-based). Storage is aggregated at the <strong>$aggLevel</strong> level to avoid double counting. Managed disk capacity attached to VMs is attributed to the Azure VM workload; only unattached disks appear under “Unattached Managed Disk”.</p>
+<p class="note">Sizes shown in GiB/TiB (1024-based). Storage is aggregated at the <strong>$aggLevel</strong> level to avoid double counting. Managed disk capacity attached to VMs is attributed to the Azure VM workload; only unattached disks appear under “Unattached Disks”.</p>
 <h2>Data Completeness by Workload</h2>
 $completenessHtml
 <h2>Top Regions by Total Capacity</h2>
@@ -880,17 +988,17 @@ $reportFile = Join-Path $OutputPath "azure_sizing_report_$timestamp.html"
 $report | Out-File -FilePath $reportFile -Encoding UTF8
 
 # Console summary
-Write-Host "`n================ WORKLOAD TOTALS ================" -ForegroundColor Cyan
-$byApp | Format-Table -AutoSize
+Write-Host "`n================ WORKLOAD TOTALS (DISPLAY) ================" -ForegroundColor Cyan
+$byAppDisplay | Format-Table -AutoSize
 Write-Host "`n================ DATA COMPLETENESS ================" -ForegroundColor Cyan
 $Completeness | Format-Table -AutoSize
 Write-Host "`n================ TOP REGIONS (by TiB) ================" -ForegroundColor Cyan
 $topRegions | Format-Table -AutoSize
 
 Write-Host "`n[INFO] Outputs"
-Write-Host " - $byAppFile"
-Write-Host " - $byRegionFile"
+Write-Host " - $byAppFile    (base, unchanged)"
+Write-Host " - $byRegionFile (base, unchanged)"
 Write-Host " - $completenessFile"
 Write-Host " - $reportFile"
-Write-Host " - Raw CSVs for each service in $OutputPath"
+Write-Host " - Per-service CSVs (always created) in $OutputPath"
 Write-Host "`n[DONE] Azure sizing complete - Share full outputs with Commvault." -ForegroundColor Green
