@@ -124,6 +124,19 @@ param (
     '_GX_AMI_'
   ),
 
+  # An authoritative list of Commvault-owned snapshot identifiers, exported from Commvault itself.
+  # Exact matches on name or id. This is the ONLY way to be certain rather than pattern-matching;
+  # everything matched here is Commvault regardless of what the regexes above say.
+  [string]$CommvaultSnapshotIdFile,
+
+  # Write an extra CSV of every distinct tag key and name prefix found, so Commvault patterns can be
+  # built from what this estate actually contains rather than from assumed conventions.
+  [switch]$AuditCreatorEvidence,
+
+  # Proceed with -Delete even though no Commvault snapshots were detected. Required in that case,
+  # because zero detections usually means the patterns missed rather than that Commvault is absent.
+  [switch]$AcknowledgeNoCommvaultSnapshots,
+
   # Treat Commvault snapshots as deletion candidates too. Off by default, and deliberately so.
   [switch]$IncludeCommvaultSnapshots,
 
@@ -257,11 +270,19 @@ function Get-AwsSnapshotCreator {
     [string]$Description,
     [hashtable]$Tags,
     [string]$OwnerAlias,
+    [string]$SnapshotId,
     [string[]]$CommvaultNamePattern,
-    [string[]]$CommvaultTagKey
+    [string[]]$CommvaultTagKey,
+    [System.Collections.Generic.HashSet[string]]$KnownCommvaultIds
   )
 
   $nameTag = if ($Tags -and $Tags.ContainsKey('Name')) { [string]$Tags['Name'] } else { '' }
+
+  # An authoritative export from Commvault beats every pattern below - it is fact, not inference.
+  if ($KnownCommvaultIds -and $KnownCommvaultIds.Count -gt 0) {
+    if ($SnapshotId -and $KnownCommvaultIds.Contains($SnapshotId)) { return 'Commvault' }
+    if ($nameTag -and $KnownCommvaultIds.Contains($nameTag)) { return 'Commvault' }
+  }
 
   if (Test-MatchAnyPattern -Value $nameTag -Patterns $CommvaultNamePattern) { return 'Commvault' }
   if (Test-MatchAnyPattern -Value $Description -Patterns $CommvaultNamePattern) { return 'Commvault' }
@@ -332,7 +353,10 @@ function Get-ImageReferencedSnapshotIds {
   } catch {
     Write-Host "[WARN] Could not enumerate AMIs: $($_.Exception.Message)" -ForegroundColor Yellow
   }
-  return $ids
+  # Comma prevents PowerShell from enumerating the set on the way out: a bare 'return $X' hands back
+  # $null for an empty set and a plain array otherwise, losing both the type and the case-insensitive
+  # comparer, so every .Contains() downstream either throws or silently turns case-sensitive.
+  return , $ids
 }
 
 function Test-SnapshotShared {
@@ -368,6 +392,151 @@ function Test-SnapshotShared {
 # -DeleteScope and the age thresholds. Keeping them separate means the report reads the same
 # whatever flags you passed, and only the Action column moves.
 #----------------------------
+
+<#
+Loads an authoritative list of Commvault-owned snapshot identifiers, exported from Commvault itself.
+
+This is the only way to be CERTAIN a snapshot is Commvault's. The -CommvaultNamePattern and
+-CommvaultTagKey defaults are informed guesses at Commvault's naming conventions; they have not been
+validated against your deployment, and a Commvault snapshot they fail to match would be classified
+cloud-native and become eligible for deletion. Exporting the real list from Commvault (Command Center,
+the CommCell console, qoperation, or the REST API - whichever your site uses) and feeding it in here
+replaces that guess with fact.
+
+Accepts a plain text file (one identifier per line) or a CSV with a header, in which case the first
+column whose name contains "snap", "name" or "id" is used. Blank lines and # comments are ignored.
+Identifiers are matched case-insensitively against both the snapshot name and its full resource id,
+so either form works.
+#>
+function Import-KnownCommvaultId {
+  param([string]$Path)
+
+  $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return , $set }
+  if (-not (Test-Path $Path)) {
+    Write-Host "[ERROR] -CommvaultSnapshotIdFile not found: $Path" -ForegroundColor Red
+    exit 1
+  }
+
+  $first = (Get-Content -Path $Path -TotalCount 1)
+  $looksCsv = $first -and $first -match ','
+
+  if ($looksCsv) {
+    $rows = Import-Csv -Path $Path
+    $col = ($rows | Select-Object -First 1).PSObject.Properties.Name |
+      Where-Object { $_ -match '(?i)snap|name|id' } | Select-Object -First 1
+    if (-not $col) {
+      Write-Host "[ERROR] $Path has no column whose name contains 'snap', 'name' or 'id'." -ForegroundColor Red
+      exit 1
+    }
+    foreach ($r in $rows) { if ($r.$col) { [void]$set.Add(([string]$r.$col).Trim()) } }
+  } else {
+    foreach ($line in (Get-Content -Path $Path)) {
+      $v = $line.Trim()
+      if ($v -and -not $v.StartsWith('#')) { [void]$set.Add($v) }
+    }
+  }
+
+  Write-Host "[INFO] Loaded $($set.Count) authoritative Commvault identifier(s) from $Path" -ForegroundColor Green
+  # Comma prevents PowerShell from enumerating the set on the way out: a bare 'return $X' hands back
+  # $null for an empty set and a plain array otherwise, losing both the type and the case-insensitive
+  # comparer, so every .Contains() downstream either throws or silently turns case-sensitive.
+  return , $set
+}
+
+<#
+Sanity-checks Commvault detection before anything is deleted.
+
+Pattern matching can silently fail: change a naming convention, point the script at a subscription
+whose Commvault instance stamps things differently, and every Commvault snapshot quietly becomes
+"cloud-native". Finding ZERO Commvault snapshots is the loudest signal available that this has
+happened, because an estate that runs Commvault should have some. Rather than let that sail through
+into a delete, stop and make somebody say out loud that it is expected.
+#>
+function Test-CommvaultDetection {
+  param(
+    [int]$CommvaultCount,
+    [int]$TotalCount,
+    [bool]$Acknowledged,
+    [bool]$HasAuthoritativeList
+  )
+
+  if ($TotalCount -eq 0) { return [pscustomobject]@{ Proceed = $true; Message = '' } }
+  if ($CommvaultCount -gt 0) { return [pscustomobject]@{ Proceed = $true; Message = '' } }
+  if ($Acknowledged) {
+    return [pscustomobject]@{ Proceed = $true; Message = 'No Commvault snapshots detected - acknowledged by the operator.' }
+  }
+
+  $msg = @"
+No Commvault-created snapshots were detected among $TotalCount snapshot(s).
+
+That is either correct (Commvault does not protect anything in this scope) or - more likely - the
+detection patterns do not match how your Commvault names and tags its snapshots. In the second case
+Commvault snapshots are sitting in the cloud-native categories right now, and deleting them would
+destroy recovery points.
+
+Before going any further, do one of these:
+
+  1. Export the real list from Commvault and pass it in. This is exact, not a guess:
+       -CommvaultSnapshotIdFile .\commvault-snapshots.txt
+
+  2. Work out the actual naming in this estate, then widen the patterns:
+       -AuditCreatorEvidence          (writes every distinct tag key and name prefix found)
+       -CommvaultNamePattern '<regex>' -CommvaultTagKey '<key>'
+
+  3. If Commvault genuinely protects nothing in this scope, say so explicitly:
+       -AcknowledgeNoCommvaultSnapshots
+
+Refusing to delete.
+"@
+  return [pscustomobject]@{ Proceed = $false; Message = $msg }
+}
+
+<#
+Summarises the naming and tagging actually present in the estate, so Commvault patterns can be built
+from evidence rather than from assumptions about what Commvault "usually" does. Emits every distinct
+tag key and every distinct leading name token, with counts and an example.
+#>
+function Get-CreatorEvidence {
+  param([object[]]$Rows)
+
+  $out = [System.Collections.Generic.List[object]]::new()
+
+  $tagKeys = @{}
+  foreach ($r in $Rows) {
+    if ([string]::IsNullOrWhiteSpace($r.Tags)) { continue }
+    foreach ($pair in ($r.Tags -split ';')) {
+      $k = ($pair -split '=', 2)[0].Trim()
+      if (-not $k) { continue }
+      if (-not $tagKeys.ContainsKey($k)) { $tagKeys[$k] = [pscustomobject]@{ Count = 0; Example = $r.Name; Creator = $r.Creator } }
+      $tagKeys[$k].Count++
+    }
+  }
+  foreach ($k in ($tagKeys.Keys | Sort-Object)) {
+    $out.Add([pscustomobject]@{
+        Evidence = 'TagKey'; Value = $k; Count = $tagKeys[$k].Count
+        ExampleSnapshot = $tagKeys[$k].Example; ClassifiedAs = $tagKeys[$k].Creator
+      })
+  }
+
+  # Leading token of the name - Commvault-style prefixes show up here if they are used at all.
+  $prefixes = @{}
+  foreach ($r in $Rows) {
+    if ([string]::IsNullOrWhiteSpace($r.Name)) { continue }
+    $p = ([string]$r.Name -split '[-_.]')[0]
+    if (-not $p) { continue }
+    if (-not $prefixes.ContainsKey($p)) { $prefixes[$p] = [pscustomobject]@{ Count = 0; Example = $r.Name; Creator = $r.Creator } }
+    $prefixes[$p].Count++
+  }
+  foreach ($p in ($prefixes.Keys | Sort-Object { -$prefixes[$_].Count })) {
+    $out.Add([pscustomobject]@{
+        Evidence = 'NamePrefix'; Value = $p; Count = $prefixes[$p].Count
+        ExampleSnapshot = $prefixes[$p].Example; ClassifiedAs = $prefixes[$p].Creator
+      })
+  }
+
+  return $out
+}
 
 $script:CategoryOrder = @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
 $script:AgeBandOrder = @('0-30 days', '31-90 days', '91-365 days', 'Over 365 days')
@@ -741,6 +910,7 @@ $deletedCsv = Join-Path $OutputPath "AWS_Snapshots_Deleted_$timestamp.csv"
 $htmlPath = Join-Path $OutputPath "AWS_Snapshot_Report_$timestamp.html"
 
 $results = [System.Collections.Generic.List[object]]::new()
+$knownCvIds = Import-KnownCommvaultId -Path $CommvaultSnapshotIdFile
 
 if ($DeleteFromReport) {
   #--- Approved-report mode: trust the reviewed CSV ---
@@ -828,7 +998,8 @@ if ($DeleteFromReport) {
           $nameTag = if ($tags.ContainsKey('Name')) { $tags['Name'] } else { '' }
 
           $creator = Get-AwsSnapshotCreator -Description $snap.Description -Tags $tags -OwnerAlias $snap.OwnerAlias `
-            -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
+            -SnapshotId $snap.SnapshotId -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey `
+            -KnownCommvaultIds $knownCvIds
 
           $creatorExcluded = switch ($creator) {
             'Commvault' { -not $IncludeCommvaultSnapshots }
@@ -917,7 +1088,8 @@ if ($DeleteFromReport) {
             $srcId = $rsnap.($set.SrcProp)
 
             $creator = Get-AwsSnapshotCreator -Description $snapId -Tags $tags -OwnerAlias '' `
-              -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
+              -SnapshotId $snapId -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey `
+              -KnownCommvaultIds $knownCvIds
 
             $creatorExcluded = switch ($creator) {
               'Commvault' { -not $IncludeCommvaultSnapshots }
@@ -1024,6 +1196,12 @@ if (-not $DeleteFromReport) {
     )
   }
   Write-Host "[INFO] HTML report written to $htmlPath" -ForegroundColor Green
+
+  if ($AuditCreatorEvidence) {
+    $evidenceCsv = Join-Path $OutputPath "AWS_Creator_Evidence_$timestamp.csv"
+    Get-CreatorEvidence -Rows $results | Export-Csv -Path $evidenceCsv -NoTypeInformation -WhatIf:$false
+    Write-Host "[INFO] Naming and tagging evidence written to $evidenceCsv" -ForegroundColor Green
+  }
 }
 
 Write-Host ""
@@ -1059,6 +1237,21 @@ if (-not $Delete) {
 if ($toDelete.Count -eq 0) {
   Write-Host "[INFO] Nothing in scope to delete." -ForegroundColor Green
   return
+}
+
+# A delete run is the last point at which a detection failure is still recoverable. Check it here,
+# not during the report - reporting a wrong classification costs nothing, acting on one does.
+if (-not $DeleteFromReport) {
+  $guard = Test-CommvaultDetection `
+    -CommvaultCount (@($results | Where-Object { $_.Creator -eq 'Commvault' }).Count) `
+    -TotalCount $results.Count `
+    -Acknowledged $AcknowledgeNoCommvaultSnapshots.IsPresent `
+    -HasAuthoritativeList ($knownCvIds.Count -gt 0)
+  if (-not $guard.Proceed) {
+    Write-Host "`n[ABORT] $($guard.Message)" -ForegroundColor Red
+    exit 2
+  }
+  if ($guard.Message) { Write-Host "[WARN] $($guard.Message)" -ForegroundColor Yellow }
 }
 
 if (-not $Force -and -not $WhatIfPreference) {

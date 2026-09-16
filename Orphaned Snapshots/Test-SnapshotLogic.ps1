@@ -64,7 +64,8 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
 . ([scriptblock]::Create((Get-FunctionText -Path $azureScript -Name @(
         'Get-AgeBand', 'Get-SnapshotCategory', 'Get-SnapshotAction', 'Get-RampClass', 'Format-Gib',
         'Test-MatchAnyPattern', 'Test-TagMatch', 'Test-TagKeyPresent', 'Get-AzSnapshotCreator',
-        'Test-ResourceGroupFilter', 'Test-IsLocked'))))
+        'Test-ResourceGroupFilter', 'Test-IsLocked', 'Test-CommvaultDetection', 'Get-CreatorEvidence',
+        'Import-KnownCommvaultId'))))
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
@@ -152,8 +153,9 @@ Write-Section 'Azure: who created this snapshot'
 #============================================================
 $cvName = @('^CV_', '^cvsnap', '_CvSnap', 'commvault', '^GX_', '_GX_BACKUP_')
 $cvTag = @('CV_JobId', 'CommvaultJobId', 'Commvault', '_GX_BACKUP_', '_GX_AMI_')
-function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null)
-  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Tags $Tags -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag
+function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null, $Known = $null, $Id = '')
+  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Id $Id -Tags $Tags `
+    -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
 }
 Assert-Equal 'CV_ name prefix'        (AzCreator 'CV_disk1_snap') 'Commvault'
 Assert-Equal 'case-insensitive match' (AzCreator 'myCOMMVAULTsnap') 'Commvault'
@@ -187,8 +189,9 @@ Assert-Equal 'AWS tag list becomes a hashtable' $ht['Name'] 'web01'
 Assert-Equal 'null tag list is empty'           ((ConvertTo-TagHashtable -Tags $null).Count) 0
 
 $awsCvName = $cvName + @('_GX_AMI_')
-function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '')
-  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -CommvaultNamePattern $awsCvName -CommvaultTagKey $cvTag
+function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Known = $null, $SnapId = '')
+  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -SnapshotId $SnapId `
+    -CommvaultNamePattern $awsCvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
 }
 Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'CV_vol_snap')))) 'Commvault'
 Assert-Equal 'commvault in description' (AwsCreator 'Created by Commvault IntelliSnap') 'Commvault'
@@ -222,6 +225,106 @@ Assert-Equal 'the maximum gets the top'   (Get-RampClass -Fraction 1) 'r7'
 Assert-Equal 'over-range is clamped'      (Get-RampClass -Fraction 1.5) 'r7'
 Assert-Equal 'GiB below a TiB'            (Format-Gib 512) '512 GiB'
 Assert-Equal 'rolls over to TiB'          (Format-Gib 2048) '2 TiB'
+
+
+#============================================================
+Write-Section 'Authoritative Commvault list overrides the patterns'
+#============================================================
+# The whole point: a snapshot named nothing like Commvault, carrying no Commvault tag, is still
+# Commvault if the export from Commvault says so.
+$known = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+[void]$known.Add('weird-legacy-name-2019')
+[void]$known.Add('/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id')
+
+Assert-Equal 'unmatched name is cloud-native without the list' (AzCreator 'weird-legacy-name-2019') 'CloudNative'
+Assert-Equal 'the list reclassifies it as Commvault'           (AzCreator 'weird-legacy-name-2019' 'rg1' $null $known) 'Commvault'
+Assert-Equal 'matching by full resource id also works'         (AzCreator 'anything' 'rg1' $null $known '/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id') 'Commvault'
+Assert-Equal 'list matching is case-insensitive'               (AzCreator 'WEIRD-LEGACY-NAME-2019' 'rg1' $null $known) 'Commvault'
+Assert-Equal 'a name not on the list is unaffected'            (AzCreator 'some-other-snap' 'rg1' $null $known) 'CloudNative'
+Assert-Equal 'AWS: snapshot id on the list'                    (AwsCreator 'x' @{} '' $known 'weird-legacy-name-2019') 'Commvault'
+Assert-Equal 'AWS: id not on the list'                         (AwsCreator 'x' @{} '' $known 'snap-0abc') 'CloudNative'
+
+#============================================================
+Write-Section 'The zero-detection guard'
+#============================================================
+# Finding no Commvault snapshots at all, in an estate with snapshots, means the patterns probably
+# missed. That must stop a delete rather than sail through it.
+Assert-Equal 'some Commvault found -> proceed'   ((Test-CommvaultDetection -CommvaultCount 12 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
+Assert-Equal 'none found -> BLOCKED'             ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'False'
+Assert-Equal 'none found but acknowledged'       ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $true -HasAuthoritativeList $false).Proceed) 'True'
+Assert-Equal 'empty estate is not suspicious'    ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 0 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
+# An authoritative list that matched nothing is still worth stopping for - the list may be wrong too.
+Assert-Equal 'list supplied but matched nothing -> BLOCKED' ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $true).Proceed) 'False'
+Assert-Equal 'the block explains how to fix it'  (([string](Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Message) -match 'CommvaultSnapshotIdFile') 'True'
+
+#============================================================
+Write-Section 'Creator evidence for building patterns from the real estate'
+#============================================================
+$sample = @(
+  [pscustomobject]@{ Name = 'CV_sql_snap_1'; Tags = 'CV_JobId=99; env=prod'; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'CV_sql_snap_2'; Tags = 'CV_JobId=98'; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'manual-before-patch'; Tags = 'env=prod'; Creator = 'CloudNative' }
+  [pscustomobject]@{ Name = 'weird_legacy_thing'; Tags = ''; Creator = 'CloudNative' }
+)
+$ev = Get-CreatorEvidence -Rows $sample
+Assert-Equal 'finds the CV_JobId tag key'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })).Count) 1
+Assert-Equal 'counts that tag key'          ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })[0]).Count) 2
+Assert-Equal 'finds the env tag key'        ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'env' })).Count) 1
+Assert-Equal 'finds the CV name prefix'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'CV' })[0]).Count) 2
+Assert-Equal 'splits on underscore too'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'weird' })).Count) 1
+Assert-Equal 'empty tags do not break it'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
+
+
+#============================================================
+Write-Section 'Regression: collections must survive being returned'
+#============================================================
+# PowerShell enumerates a collection on the way out of a function, so a bare "return $set" hands back
+# $null for an empty set and a plain array otherwise - losing the type and the case-insensitive
+# comparer. Every .Contains() downstream then throws or silently turns case-sensitive. The fix is
+# "return , $set"; these assertions stop it regressing.
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "cv-ids-$([guid]::NewGuid()).txt"
+
+$empty = Import-KnownCommvaultId -Path ''
+Assert-Equal 'no file still returns a real set, not $null' ($null -ne $empty) 'True'
+Assert-Equal 'and it is a HashSet'                         ($empty.GetType().Name) 'HashSet`1'
+Assert-Equal 'and it is empty'                             ($empty.Count) 0
+
+@('snap-one', 'snap-two') | Set-Content -Path $tmp
+$loaded = Import-KnownCommvaultId -Path $tmp
+Assert-Equal 'a populated file stays a HashSet' ($loaded.GetType().Name) 'HashSet`1'
+Assert-Equal 'with both entries'                ($loaded.Count) 2
+Assert-Equal 'and keeps its case-insensitive comparer' ($loaded.Contains('SNAP-ONE')) 'True'
+
+# A single-entry file is the case that most easily collapses to a bare string.
+'only-one' | Set-Content -Path $tmp
+$one = Import-KnownCommvaultId -Path $tmp
+Assert-Equal 'a one-line file does not collapse to a string' ($one.GetType().Name) 'HashSet`1'
+Assert-Equal 'and still matches'                             ($one.Contains('ONLY-ONE')) 'True'
+
+# Comments and blanks are ignored.
+@('# exported from Commvault', '', 'real-snap', '   ') | Set-Content -Path $tmp
+$filtered = Import-KnownCommvaultId -Path $tmp
+Assert-Equal 'comments and blank lines are skipped' ($filtered.Count) 1
+
+# CSV form, as exported from most tools.
+@('SnapshotName,JobId', 'csv-snap-1,900', 'csv-snap-2,901') | Set-Content -Path $tmp
+$csv = Import-KnownCommvaultId -Path $tmp
+Assert-Equal 'CSV export is understood'  ($csv.Count) 2
+Assert-Equal 'CSV picks the right column' ($csv.Contains('csv-snap-1')) 'True'
+
+Remove-Item $tmp -ErrorAction SilentlyContinue
+
+# The other set-returning functions call cloud cmdlets, so assert at the source level instead.
+foreach ($pair in @(@{ File = $azureScript; Fn = 'Get-ImageReferencedSnapshotIds' },
+                    @{ File = $azureScript; Fn = 'Get-LockedResourceIds' },
+                    @{ File = $azureScript; Fn = 'Import-KnownCommvaultId' },
+                    @{ File = $awsScript; Fn = 'Get-ImageReferencedSnapshotIds' },
+                    @{ File = $awsScript; Fn = 'Import-KnownCommvaultId' })) {
+  $text = Get-FunctionText -Path $pair.File -Name @($pair.Fn)
+  # Catches a bare return anywhere in the function, including an early one inside a guard clause.
+  $bare = $text -match 'return\s+\$(ids|set)\s*[}\r\n]'
+  Assert-Equal "$(Split-Path $pair.File -Leaf)/$($pair.Fn) does not bare-return its set" (-not $bare) 'True'
+}
 
 #============================================================
 Write-Section 'End to end: a realistic estate lands where it should'

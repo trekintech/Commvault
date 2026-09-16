@@ -100,26 +100,74 @@ cannot be named at all.
 
 ---
 
-## ⚠️ Read this before deleting anything
+## ⚠️ Commvault detection: what is guaranteed and what is not
 
-**Verify the Commvault detection patterns against your own environment first.** Commvault's snapshot
-naming and tagging varies by agent, version and IntelliSnap configuration. The defaults are a
-reasonable starting point, not a guarantee:
+**Pattern matching cannot guarantee a snapshot is Commvault's.** By default these scripts identify
+Commvault snapshots with regexes over names and tag keys. Those defaults are informed by Commvault's
+usual conventions — they have **not** been validated against your deployment. Commvault's naming varies
+by agent, version and IntelliSnap configuration, so a Commvault snapshot whose name and tags miss every
+pattern will be classified `CloudNative` and become eligible for deletion. That would destroy a
+recovery point.
 
-| | Default name patterns (regex) | Default tag keys |
-|---|---|---|
-| Azure | `^CV_`, `^cvsnap`, `_CvSnap`, `commvault`, `^GX_`, `_GX_BACKUP_` | `CV_JobId`, `CommvaultJobId`, `Commvault`, `_GX_BACKUP_`, `_GX_AMI_` |
-| AWS | as above, plus `_GX_AMI_` (matched against the `Name` tag *and* the description) | as above |
+Three mechanisms exist to close that gap, in descending order of certainty.
 
-Run in report mode, open the **By creator** table in the HTML, and confirm every snapshot you expect
-Commvault to own is counted under `Commvault`. If any show up as `CloudNative`, widen the patterns
-before you let anything delete:
+### 1. Give it the real list (the only certain option)
+
+Export the snapshots Commvault owns from Commvault itself — Command Center, the CommCell console,
+`qoperation`, or the REST API, whichever your site uses — and pass the file in:
+
+```powershell
+.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -CommvaultSnapshotIdFile .\commvault-snapshots.txt
+```
+
+Anything on that list is classified `Commvault` regardless of what the patterns say. This replaces
+inference with fact, and it is the only way to be certain. The file can be:
+
+- plain text, one identifier per line (`#` comments and blank lines ignored), or
+- a CSV with a header, in which case the first column whose name contains `snap`, `name` or `id` is used.
+
+Identifiers match case-insensitively against the snapshot **name** and its full **resource id** (Azure)
+or **snapshot id** (AWS), so whichever form your export produces will work.
+
+### 2. Build the patterns from your own estate
+
+If you can't export from Commvault, at least stop guessing at the patterns. This writes a CSV of every
+distinct tag key and name prefix actually present, with counts and examples:
+
+```powershell
+.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -AuditCreatorEvidence
+```
+
+Find the rows Commvault is really producing, then feed them back:
 
 ```powershell
 .\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions `
   -CommvaultNamePattern '^CV_','commvault','^SNAP_CV' `
   -CommvaultTagKey 'CV_JobId','CommvaultInstance'
 ```
+
+### 3. The zero-detection guard (on by default)
+
+If a `-Delete` run finds **no** Commvault snapshots at all, the script **aborts before deleting
+anything**. In an estate that runs Commvault, zero detections almost always means the patterns missed
+rather than that Commvault is absent — so it stops and tells you how to fix it rather than proceeding.
+
+To delete anyway — only correct when Commvault genuinely protects nothing in that scope:
+
+```powershell
+-AcknowledgeNoCommvaultSnapshots
+```
+
+This is a backstop for a total detection failure. It cannot catch a *partial* one, where some Commvault
+snapshots match and others don't. Only option 1 closes that.
+
+### Recommended before any deletion
+
+1. Run in report mode with `-AuditCreatorEvidence`.
+2. Open the HTML report's **By creator** table. Does the `Commvault` count match what Commvault says
+   it is protecting? If it reads zero, or looks low, your patterns are wrong.
+3. Export the authoritative list and re-run with `-CommvaultSnapshotIdFile`.
+4. Only then review the candidates CSV and delete from it.
 
 Deletion is permanent. Azure snapshots and EBS snapshots cannot be recovered once removed.
 
@@ -179,6 +227,7 @@ Written to `-OutputPath` (default: current directory), timestamped:
 | `*_Snapshots_Candidates_<ts>.csv` | The `Action = Delete` set — the file to review and feed to `-DeleteFromReport`. |
 | `*_Snapshot_Report_<ts>.html` | Hero total, per-category tiles, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
 | `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Only when `-Delete` runs. |
+| `*_Creator_Evidence_<ts>.csv` | Every distinct tag key and name prefix in the estate. Only with `-AuditCreatorEvidence`. |
 
 Reports are always written, including under `-WhatIf`.
 
@@ -203,7 +252,10 @@ Shared by both scripts:
 | `-MinAgeDays` | `30` | Age bar for `Orphaned`. |
 | `-SourceActiveMinAgeDays` | `365` | Age bar for `SourceActive` and `Unverifiable`. |
 | `-DeleteScope` | `Orphaned` | Which categories `-Delete` may act on. `Protected`/`InUse` not accepted. |
-| `-CommvaultNamePattern` / `-CommvaultTagKey` | see above | Commvault detection. Tune these. |
+| `-CommvaultSnapshotIdFile` | — | **Authoritative** Commvault identifier list exported from Commvault. Exact match, beats the patterns. |
+| `-AuditCreatorEvidence` | off | Write a CSV of every distinct tag key and name prefix found, to build patterns from evidence. |
+| `-AcknowledgeNoCommvaultSnapshots` | off | Permit `-Delete` when zero Commvault snapshots were detected. Otherwise that aborts. |
+| `-CommvaultNamePattern` / `-CommvaultTagKey` | see above | Pattern-based Commvault detection. Tune these, or bypass with the file above. |
 | `-IncludeCommvaultSnapshots` | off | Move Commvault snapshots out of `Protected`. Not recommended. |
 | `-IncludeBackupServiceSnapshots` | off | Move cloud backup-service snapshots out of `Protected`. Strongly discouraged. |
 | `-KeepTagKey` | `DoNotDelete`, `KeepSnapshot`, `Preserve` | Tag keys that force `Protected`. |
@@ -234,7 +286,9 @@ cap, keep the scope narrow, and keep the logs.
 ```
 
 Report for several weeks before letting anything delete on a schedule, and do not widen
-`-DeleteScope` on a scheduled run until you have watched the `Review` list settle.
+`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. On a scheduled run
+especially, pass `-CommvaultSnapshotIdFile` from a fresh export rather than relying on pattern
+matching — nobody is watching the output.
 
 ---
 
@@ -244,8 +298,9 @@ Report for several weeks before letting anything delete on a schedule, and do no
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-74 assertions over the category rules, precedence, age bars, delete scoping, both clouds' Commvault
-detection, Azure lock scoping and the AWS `vol-ffffffff` sentinel. It parses the two scripts to lift
+109 assertions over the category rules, precedence, age bars, delete scoping, the authoritative-list
+override, the zero-detection guard, both clouds' Commvault detection, Azure lock scoping, the AWS
+`vol-ffffffff` sentinel, and a regression guard on collection returns. It parses the two scripts to lift
 their functions out, so it never touches a cloud and needs no credentials. **Run it after changing any
 detection pattern or age bar.**
 
