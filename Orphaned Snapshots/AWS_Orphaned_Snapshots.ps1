@@ -2,69 +2,82 @@
 
 <#
 .SYNOPSIS
-Reports and optionally deletes orphaned cloud-native AWS snapshots — snapshots that were NOT created by Commvault.
+Reports every cloud-native AWS snapshot by category and age, and optionally deletes the ones you put in scope.
 
 .DESCRIPTION
 The classic AWS snapshot leak is the deregistered AMI: deregistering an image does not delete the EBS
-snapshots behind it, and those snapshots then bill forever with nothing pointing at them. Deleted
-volumes leave the same residue. This script finds both, across every region and account you point it
-at, and removes them on request.
+snapshots behind it, and those then bill forever with nothing pointing at them. Deleted volumes leave
+the same residue, and so do the manual snapshots nobody ever revisits. This script classifies every
+snapshot it can see, shows where the capacity actually sits, and removes what you explicitly scope.
 
-Covers
-- EBS snapshots owned by the account (always)
-- RDS manual DB and DB cluster snapshots (-IncludeRdsSnapshots)
+Covers EBS snapshots owned by the account (always) and manual RDS DB / DB cluster snapshots
+(-IncludeRdsSnapshots).
 
-Scope of "orphaned" for EBS
-- The source volume no longer exists (the default, strongest signal), AND
-- no AMI — registered or not — references the snapshot in its block device mappings, AND
-- the snapshot is older than -MinAgeDays, AND
-- it carries no keep-tag, and is not shared with another account (checked with -CheckSharing).
+CATEGORIES
+Each snapshot lands in exactly one, and all five are always reported:
 
-Optionally (-TreatOldSnapshotsAsOrphaned) snapshots whose source volume still exists but which are
-older than -MaxAgeDays are flagged too, under a separate verdict.
+  Orphaned      The source EBS volume (or RDS instance/cluster) is provably gone. The literal
+                orphan, and the safe case.
+  SourceActive  The source still exists. NOT an orphan - but still billing, and usually the bigger
+                number. A pre-upgrade snapshot from two years ago lives here.
+  Unverifiable  No usable source recorded - AWS reports volume vol-ffffffff for copied and imported
+                snapshots. Orphan status cannot be proven either way, so a human has to look.
+  InUse         Referenced by an AMI block device mapping. Doing a job.
+  Protected     Commvault, AWS Backup, DLM, an AWS-managed image, a keep-tag, or shared with
+                another account.
 
-Scope of "cloud-native" (i.e. what this script deliberately leaves alone)
-- Commvault-created snapshots    -> matched by name/description regex or tag (see -CommvaultNamePattern, -CommvaultTagKey)
-- AWS Backup-created snapshots   -> tag aws:backup:source-resource
-- DLM lifecycle-managed          -> tag aws:dlm:lifecycle-policy-id / dlm:managed
-- AWS-managed / marketplace      -> owner alias amazon, or snapshots not owned by this account
-DLM and AWS Backup already expire their own snapshots on a schedule; deleting them out from under the
-policy breaks the recovery point and the policy will just make another. They are reported, not deleted.
+Category is a fact about the snapshot. ACTION is what this run would do about it:
 
-IMPORTANT — verify the Commvault detection patterns against your own environment before deleting
-anything. Commvault's snapshot naming and tagging varies by agent, version and IntelliSnap
-configuration. Run in report mode first, open the classification CSV, and confirm every snapshot you
-expect Commvault to own is classified as "Commvault". Adjust -CommvaultNamePattern /
--CommvaultTagKey until it is.
+  Delete        Its category is in -DeleteScope and it is past that category's age bar.
+  Review        A candidate held back - wrong category for the current scope, or too young.
+  Keep          InUse or Protected. Never actionable.
 
-Safety model
-- Report-only by default. Nothing is deleted unless -Delete is supplied.
-- -Delete honours -WhatIf and -Confirm, and refuses to run unattended without -Force.
+So the report reads the same whatever flags you pass; only the Action column moves.
+
+WHAT IS EXCLUDED FROM DELETION
+Commvault-created snapshots (matched on Name tag / description regex and tag), plus AWS Backup
+(tag aws:backup:*) and DLM lifecycle-managed snapshots (tag aws:dlm:*). DLM and AWS Backup expire
+their own snapshots on a schedule; deleting one out from under its policy breaks the recovery point
+and the policy just makes another. They are classified, counted and reported, never deleted.
+
+IMPORTANT - verify the Commvault detection patterns against your own environment before deleting
+anything. Commvault snapshot naming varies by agent, version and IntelliSnap configuration. Run in
+report mode first, check the "By creator" table, and confirm every snapshot you expect Commvault to
+own is classified as "Commvault". Adjust -CommvaultNamePattern / -CommvaultTagKey until it is.
+
+SAFETY MODEL
+- Report-only by default. Nothing is deleted without -Delete.
+- -DeleteScope decides which categories -Delete may touch. Default: Orphaned only.
+  Protected and InUse can never be named, and a hand-edited CSV cannot smuggle them in.
+- Two age bars: -MinAgeDays for Orphaned, the much higher -SourceActiveMinAgeDays for
+  SourceActive and Unverifiable.
+- -Delete honours -WhatIf and -Confirm, and prompts for a typed DELETE unless -Force.
 - -MaxDeletions caps a single run.
-- -DeleteFromReport <csv> re-reads an approved CSV so an admin can review the report, delete the rows
-  they want to keep, and feed the file back for execution. This is the recommended workflow.
+- -DeleteFromReport <csv> re-reads an approved CSV, so an admin can review the candidate list,
+  delete the rows they want to keep, and feed the file back. This is the recommended workflow.
 
-Outputs (written to -OutputPath)
-- AWS_Snapshots_All_<timestamp>.csv           every snapshot found, with its classification and verdict
-- AWS_Snapshots_Orphaned_<timestamp>.csv      orphan candidates only (the file to feed to -DeleteFromReport)
-- AWS_Snapshots_Deleted_<timestamp>.csv       deletion log, written only when -Delete runs
-- AWS_Orphaned_Snapshots_<timestamp>.html     summary report
+OUTPUTS (to -OutputPath)
+- AWS_Snapshots_All_<ts>.csv         every snapshot, with category, age band, action and reasoning
+- AWS_Snapshots_Candidates_<ts>.csv  the Action=Delete set (feed this to -DeleteFromReport)
+- AWS_Snapshot_Report_<ts>.html      summary: totals, category x age heatmap, in-scope and
+                                     held-for-review tables, breakdown by creator
+- AWS_Snapshots_Deleted_<ts>.csv     deletion log, written only when -Delete runs
 
 .EXAMPLE
 .\AWS_Orphaned_Snapshots.ps1
-Report across every enabled region using the default credential chain. Deletes nothing.
+Classify everything across every enabled region using the default credential chain. Deletes nothing.
 
 .EXAMPLE
-.\AWS_Orphaned_Snapshots.ps1 -Region eu-west-1,us-east-1 -MinAgeDays 90 -IncludeRdsSnapshots
-Report on EBS and manual RDS snapshots at least 90 days old in two regions.
+.\AWS_Orphaned_Snapshots.ps1 -Region eu-west-1,us-east-1 -IncludeRdsSnapshots -CheckSharing
+Report on EBS and manual RDS snapshots in two regions, excluding anything shared out.
 
 .EXAMPLE
-.\AWS_Orphaned_Snapshots.ps1 -ProfileName prod,dev -Delete -WhatIf
-Show exactly what would be deleted across two accounts, without deleting it.
+.\AWS_Orphaned_Snapshots.ps1 -ProfileName prod -DeleteScope Orphaned,SourceActive -Delete -WhatIf
+Show what would go if you also reaped year-old snapshots whose volumes are still live.
 
 .EXAMPLE
-.\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport .\AWS_Snapshots_Orphaned_20260916-101500.csv -Delete -Force
-Delete precisely the snapshots left in an approved report file.
+.\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport .\AWS_Snapshots_Candidates_20260916-101500.csv -Delete
+Delete precisely the snapshots left in an approved candidate file.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
@@ -75,14 +88,19 @@ param (
   # Named credential profiles to iterate. Default: the ambient credential chain (one account).
   [string[]]$ProfileName,
 
-  # Only consider snapshots at least this old. Guards against deleting a snapshot taken minutes ago.
+  # Age bar for Orphaned snapshots - the source volume is provably gone. Guards against reaping a
+  # snapshot taken minutes ago by a process that had not finished with it.
   [ValidateRange(0, 3650)]
   [int]$MinAgeDays = 30,
 
-  # With -TreatOldSnapshotsAsOrphaned, also flag snapshots older than this whose source volume still exists.
-  [ValidateRange(1, 3650)]
-  [int]$MaxAgeDays = 365,
-  [switch]$TreatOldSnapshotsAsOrphaned,
+  # Age bar for SourceActive and Unverifiable snapshots. Deliberately much higher: the source volume
+  # is alive (or unknown), so deleting one is a bigger call than reaping a true orphan.
+  [ValidateRange(0, 3650)]
+  [int]$SourceActiveMinAgeDays = 365,
+
+  # Which categories -Delete may act on. Protected and InUse can never be named here.
+  [ValidateSet('Orphaned', 'SourceActive', 'Unverifiable')]
+  [string[]]$DeleteScope = @('Orphaned'),
 
   [switch]$IncludeRdsSnapshots,
 
@@ -134,8 +152,8 @@ param (
   [switch]$AutoInstallModules
 )
 
-$ScriptVersion = "1.0.0"
-Write-Host "`n[INFO] AWS Orphaned Snapshot Report v$ScriptVersion" -ForegroundColor Green
+$ScriptVersion = "2.0.0"
+Write-Host "`n[INFO] AWS Snapshot Report v$ScriptVersion" -ForegroundColor Green
 
 #----------------------------
 # Module handling
@@ -267,78 +285,6 @@ function Get-AwsSnapshotCreator {
 }
 
 <#
-Applies the orphan rules to one already-gathered snapshot fact set and returns the verdict plus the
-reasons behind it. Kept free of AWS calls so the decision logic can be tested directly.
-
-Verdict is one of:
-  Orphaned        source volume is gone and every safety check passed
-  StaleButInUse   source volume still exists but the snapshot exceeds -MaxAgeDays (-TreatOldSnapshotsAsOrphaned)
-  Retain          anything else
-#>
-function Get-SnapshotVerdict {
-  param(
-    [bool]$SourceVolumeExists,
-    [bool]$HasSourceVolumeReference,
-    [double]$AgeDays,
-    [bool]$ReferencedByImage,
-    [bool]$HasKeepTag,
-    [bool]$IsShared,
-    [string]$Creator,
-    [bool]$CreatorExcluded,
-    [int]$MinAgeDays,
-    [int]$MaxAgeDays,
-    [bool]$TreatOldSnapshotsAsOrphaned
-  )
-
-  $reasons = [System.Collections.Generic.List[string]]::new()
-
-  if ($CreatorExcluded) {
-    $reasons.Add("Created by $Creator - excluded from deletion")
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-  if ($HasKeepTag) {
-    $reasons.Add('Carries a keep-tag')
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-  if ($IsShared) {
-    $reasons.Add('Shared with another account via createVolumePermission')
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-  if ($ReferencedByImage) {
-    $reasons.Add('Referenced by an AMI block device mapping')
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-  if ($AgeDays -lt $MinAgeDays) {
-    $reasons.Add("Younger than MinAgeDays ($([math]::Round($AgeDays,1)) < $MinAgeDays)")
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-
-  if (-not $HasSourceVolumeReference) {
-    # No VolumeId recorded (e.g. an import/copy). Cannot prove the source is gone.
-    $reasons.Add('No source volume reference recorded - cannot confirm orphan status')
-    if ($TreatOldSnapshotsAsOrphaned -and $AgeDays -ge $MaxAgeDays) {
-      $reasons.Add("Older than MaxAgeDays ($([math]::Round($AgeDays,1)) >= $MaxAgeDays)")
-      return [pscustomobject]@{ Verdict = 'StaleButInUse'; Reason = ($reasons -join '; ') }
-    }
-    return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-  }
-
-  if (-not $SourceVolumeExists) {
-    $reasons.Add('Source EBS volume no longer exists')
-    $reasons.Add("Age $([math]::Round($AgeDays,1)) days >= MinAgeDays $MinAgeDays")
-    return [pscustomobject]@{ Verdict = 'Orphaned'; Reason = ($reasons -join '; ') }
-  }
-
-  if ($TreatOldSnapshotsAsOrphaned -and $AgeDays -ge $MaxAgeDays) {
-    $reasons.Add("Source volume still exists but snapshot is older than MaxAgeDays ($([math]::Round($AgeDays,1)) >= $MaxAgeDays)")
-    return [pscustomobject]@{ Verdict = 'StaleButInUse'; Reason = ($reasons -join '; ') }
-  }
-
-  $reasons.Add('Source EBS volume still exists')
-  return [pscustomobject]@{ Verdict = 'Retain'; Reason = ($reasons -join '; ') }
-}
-
-<#
 AWS records a snapshot's source volume as "vol-xxxx" for a real volume, but as "vol-ffffffff" (the
 sentinel AWS uses for a snapshot with no live volume behind it) for AMI-backing and copied snapshots.
 Treat the sentinel as "no reference" so it is never mistaken for a deleted volume.
@@ -405,98 +351,377 @@ function Test-SnapshotShared {
 }
 
 #----------------------------
-# Reporting
+# Classification model (shared verbatim between the Azure and AWS scripts)
+#
+# Every snapshot gets exactly one Category. "Orphaned" is the literal case - the source is gone.
+# "SourceActive" is the one people usually mean when they say orphaned: the disk/volume is still
+# there, so the snapshot is not an orphan, but it is still billing and nobody has looked at it in
+# a year. Both are reported; only Orphaned is in the default deletion scope.
+#
+#   Protected     Commvault, a cloud backup service, a keep-tag or a lock. Never deletable.
+#   InUse         Backing a Managed Image / Gallery version / AMI. Never deletable.
+#   Orphaned      Source disk or volume confirmed gone. True orphan.
+#   SourceActive  Source still exists. Not an orphan; judge it on age.
+#   Unverifiable  No provable source reference. Cannot be proven either way.
+#
+# Category is a fact about the snapshot. Action is what THIS run would do about it, given
+# -DeleteScope and the age thresholds. Keeping them separate means the report reads the same
+# whatever flags you passed, and only the Action column moves.
 #----------------------------
+
+$script:CategoryOrder = @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+$script:AgeBandOrder = @('0-30 days', '31-90 days', '91-365 days', 'Over 365 days')
+
+function Get-AgeBand {
+  param([double]$AgeDays)
+  if ($AgeDays -le 30) { return '0-30 days' }
+  if ($AgeDays -le 90) { return '31-90 days' }
+  if ($AgeDays -le 365) { return '91-365 days' }
+  return 'Over 365 days'
+}
+
+function Get-SnapshotCategory {
+  param(
+    [bool]$SourceExists,
+    [bool]$HasSourceReference,
+    [bool]$ReferencedByImage,
+    [bool]$HasKeepTag,
+    [bool]$IsPinned,          # Azure: resource lock. AWS: shared with another account.
+    [string]$PinnedReason,
+    [string]$Creator,
+    [bool]$CreatorExcluded
+  )
+
+  if ($CreatorExcluded) { return [pscustomobject]@{ Category = 'Protected'; Reason = "Created by $Creator - excluded from deletion" } }
+  if ($HasKeepTag) { return [pscustomobject]@{ Category = 'Protected'; Reason = 'Carries a keep-tag' } }
+  if ($IsPinned) { return [pscustomobject]@{ Category = 'Protected'; Reason = $PinnedReason } }
+  if ($ReferencedByImage) { return [pscustomobject]@{ Category = 'InUse'; Reason = 'Backs an image that still exists' } }
+  if (-not $HasSourceReference) { return [pscustomobject]@{ Category = 'Unverifiable'; Reason = 'No source reference recorded - orphan status cannot be proven' } }
+  if (-not $SourceExists) { return [pscustomobject]@{ Category = 'Orphaned'; Reason = 'Source no longer exists' } }
+  return [pscustomobject]@{ Category = 'SourceActive'; Reason = 'Source still exists - not an orphan, judge on age' }
+}
+
+<#
+Decides what this run would do with a snapshot.
+
+  Delete  in scope, and past the age bar for its category
+  Review  a candidate, but held back by scope or age - this is where the reporting value lives
+  Keep    Protected or InUse; never actionable
+
+Orphaned clears at -MinAgeDays. SourceActive and Unverifiable have to clear the much higher
+-SourceActiveMinAgeDays, because deleting a snapshot whose source is alive (or unknown) is a
+bigger call than reaping one whose source is provably gone.
+#>
+function Get-SnapshotAction {
+  param(
+    [string]$Category,
+    [double]$AgeDays,
+    [string[]]$DeleteScope,
+    [int]$MinAgeDays,
+    [int]$SourceActiveMinAgeDays
+  )
+
+  if ($Category -in @('Protected', 'InUse')) {
+    return [pscustomobject]@{ Action = 'Keep'; Note = 'Not a deletion candidate' }
+  }
+
+  $bar = if ($Category -eq 'Orphaned') { $MinAgeDays } else { $SourceActiveMinAgeDays }
+
+  if ($Category -notin $DeleteScope) {
+    return [pscustomobject]@{ Action = 'Review'; Note = "$Category is not in -DeleteScope (currently: $($DeleteScope -join ', '))" }
+  }
+  if ($AgeDays -lt $bar) {
+    return [pscustomobject]@{ Action = 'Review'; Note = "Younger than the $Category age bar ($([math]::Round($AgeDays,1)) < $bar days)" }
+  }
+  return [pscustomobject]@{ Action = 'Delete'; Note = "In -DeleteScope and past the $bar day bar" }
+}
+
+#----------------------------
+# HTML report (shared verbatim between the Azure and AWS scripts)
+#
+# Colours, ramp steps and dark-mode steps come from the data-viz reference palette.
+# The category x age grid is a heatmap, so it uses the SEQUENTIAL blue ramp (one hue, darker =
+# more) rather than categorical hues - the grid encodes magnitude, not identity. Every cell
+# carries its number as text, which is also the relief for the light ramp steps that sit under
+# 3:1 contrast. Status colours always appear beside a written label, never alone.
+#----------------------------
+<#
+Buckets a 0..1 magnitude onto one of seven sequential ramp classes.
+
+Returns a CSS class, not a hex value, because light and dark need genuinely different steps: on the
+light surface the ramp darkens as values rise, on the dark surface it brightens. Emitting a class
+lets the stylesheet pick the right set - an inline hex would force dark mode to reuse the light
+steps, which is the thing that makes a dark-mode chart glare. Cell ink flips with the class too.
+#>
+function Get-RampClass {
+  param([double]$Fraction)
+  if ($Fraction -le 0) { return 'r0' }
+  $i = [math]::Ceiling($Fraction * 7)
+  if ($i -lt 1) { $i = 1 }
+  if ($i -gt 7) { $i = 7 }
+  return "r$i"
+}
+
+function Format-Gib {
+  param([double]$Gib)
+  if ($Gib -ge 1024) { return "$([math]::Round($Gib / 1024, 1)) TiB" }
+  return "$([math]::Round($Gib, 0)) GiB"
+}
+
 function New-HtmlReport {
   param(
     [object[]]$Rows,
     [string]$Path,
-    [hashtable]$Totals
+    [hashtable]$Totals,
+    [hashtable]$Schema
   )
 
-  $style = @"
-<style>
-body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #1f2933; }
-h1 { font-size: 22px; margin-bottom: 4px; }
-h2 { font-size: 16px; margin-top: 28px; border-bottom: 2px solid #e4e7eb; padding-bottom: 6px; }
-.meta { color: #616e7c; font-size: 12px; margin-bottom: 18px; }
-table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 10px; }
-th { background: #f5f7fa; text-align: left; padding: 8px; border: 1px solid #e4e7eb; }
-td { padding: 6px 8px; border: 1px solid #e4e7eb; vertical-align: top; }
-tr:nth-child(even) td { background: #fafbfc; }
-.card { display: inline-block; border: 1px solid #e4e7eb; border-radius: 6px; padding: 12px 18px; margin: 6px 10px 6px 0; min-width: 150px; }
-.card .value { font-size: 20px; font-weight: 600; }
-.card .label { font-size: 11px; color: #616e7c; text-transform: uppercase; letter-spacing: .04em; }
-.orphan { color: #b91c1c; font-weight: 600; }
-.stale { color: #b45309; font-weight: 600; }
-.retain { color: #3f6212; }
-.note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 10px 14px; font-size: 12px; margin-top: 18px; }
-</style>
-"@
+  $enc = { param([string]$s) [System.Web.HttpUtility]::HtmlEncode($s) }
 
-  $cards = @"
-<div class="card"><div class="value">$($Totals.TotalSnapshots)</div><div class="label">Snapshots scanned</div></div>
-<div class="card"><div class="value">$($Totals.CloudNative)</div><div class="label">Cloud-native</div></div>
-<div class="card"><div class="value">$($Totals.Commvault)</div><div class="label">Commvault (excluded)</div></div>
-<div class="card"><div class="value orphan">$($Totals.Orphaned)</div><div class="label">Orphaned</div></div>
-<div class="card"><div class="value">$($Totals.OrphanedGiB) GiB</div><div class="label">Reclaimable</div></div>
-<div class="card"><div class="value">$($Totals.Currency) $($Totals.EstimatedMonthlySaving)</div><div class="label">Est. monthly saving</div></div>
-<div class="card"><div class="value">$($Totals.Unverifiable)</div><div class="label">Unverifiable</div></div>
-"@
+  #--- headline ---
+  $deleteRows = @($Rows | Where-Object { $_.Action -eq 'Delete' })
+  $reviewRows = @($Rows | Where-Object { $_.Action -eq 'Review' })
+  $deleteGib = [math]::Round((($deleteRows | Measure-Object SizeGiB -Sum).Sum), 2)
+  $reviewGib = [math]::Round((($reviewRows | Measure-Object SizeGiB -Sum).Sum), 2)
 
-  $candidates = $Rows | Where-Object { $_.Verdict -in @('Orphaned', 'StaleButInUse') } | Sort-Object -Property @{Expression = 'SizeGiB'; Descending = $true }
-
-  $rowHtml = ($candidates | ForEach-Object {
-      $cls = switch ($_.Verdict) { 'Orphaned' { 'orphan' } 'StaleButInUse' { 'stale' } default { 'retain' } }
-      "<tr><td>$([System.Web.HttpUtility]::HtmlEncode($_.AccountId))</td><td>$($_.Region)</td><td>$($_.SnapshotType)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.SnapshotId))</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Name))</td><td>$($_.SizeGiB)</td><td>$($_.AgeDays)</td><td>$($_.Creator)</td><td class='$cls'>$($_.Verdict)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Reason))</td></tr>"
-    }) -join "`n"
-
-  if ([string]::IsNullOrWhiteSpace($rowHtml)) {
-    $rowHtml = "<tr><td colspan='10'>No orphan candidates found.</td></tr>"
+  #--- category x age heatmap ---
+  $cells = @{}
+  $maxCell = 0.0
+  foreach ($cat in $script:CategoryOrder) {
+    foreach ($band in $script:AgeBandOrder) {
+      $g = @($Rows | Where-Object { $_.Category -eq $cat -and $_.AgeBand -eq $band })
+      $gib = [double]([math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2))
+      $cells["$cat|$band"] = [pscustomobject]@{ Count = $g.Count; Gib = $gib }
+      if ($gib -gt $maxCell) { $maxCell = $gib }
+    }
   }
 
-  $byCreator = ($Rows | Group-Object Creator | Sort-Object Count -Descending | ForEach-Object {
+  $catMeta = @{
+    'Orphaned'     = @{ Colour = '#d03b3b'; Blurb = 'Source is gone. The true orphans.' }
+    'SourceActive' = @{ Colour = '#fab219'; Blurb = 'Source still exists. Not orphaned, but still billing.' }
+    'Unverifiable' = @{ Colour = '#ec835a'; Blurb = 'No provable source. Needs a human.' }
+    'InUse'        = @{ Colour = '#2a78d6'; Blurb = 'Backing a live image. Leave alone.' }
+    'Protected'    = @{ Colour = '#0ca30c'; Blurb = 'Commvault, backup service, keep-tag or lock.' }
+  }
+
+  $heatRows = foreach ($cat in $script:CategoryOrder) {
+    $tds = foreach ($band in $script:AgeBandOrder) {
+      $c = $cells["$cat|$band"]
+      $frac = if ($maxCell -gt 0) { $c.Gib / $maxCell } else { 0 }
+      if ($c.Count -eq 0) {
+        "<td class='cell empty' title='$cat / $band&#10;nothing here'><span class='cv'>&middot;</span></td>"
+      } else {
+        $tip = "$cat / $band&#10;$($c.Count) snapshot(s)&#10;$(Format-Gib $c.Gib)"
+        "<td class='cell $(Get-RampClass -Fraction $frac)' title='$tip'><span class='cv'>$(Format-Gib $c.Gib)</span><span class='cn'>$($c.Count)</span></td>"
+      }
+    }
+    $rowGib = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Gib } | Measure-Object -Sum).Sum
+    $rowCount = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Count } | Measure-Object -Sum).Sum
+    @"
+<tr>
+  <th scope="row"><span class="dot" style="background:$($catMeta[$cat].Colour)"></span>$cat<em>$($catMeta[$cat].Blurb)</em></th>
+  $($tds -join "`n  ")
+  <td class="tot">$(Format-Gib $rowGib)<span class="cn">$rowCount</span></td>
+</tr>
+"@
+  }
+
+  $bandHeads = ($script:AgeBandOrder | ForEach-Object { "<th scope='col'>$_</th>" }) -join "`n      "
+
+  #--- detail tables ---
+  function Format-DetailTable {
+    param([object[]]$Set, [string]$Empty)
+    if ($Set.Count -eq 0) { return "<p class='none'>$Empty</p>" }
+    $heads = ($Schema.Columns | ForEach-Object { "<th scope='col'>$($_.Label)</th>" }) -join ''
+    $body = ($Set | Sort-Object -Property @{Expression = 'SizeGiB'; Descending = $true } | Select-Object -First 250 | ForEach-Object {
+        $r = $_
+        $tds = ($Schema.Columns | ForEach-Object {
+            $v = $r.($_.Prop)
+            $cls = if ($_.Numeric) { " class='num'" } else { '' }
+            "<td$cls>$([System.Web.HttpUtility]::HtmlEncode([string]$v))</td>"
+          }) -join ''
+        "<tr><td><span class='dot' style='background:$($catMeta[$r.Category].Colour)'></span>$($r.Category)</td>$tds<td>$([System.Web.HttpUtility]::HtmlEncode([string]$r.Reason))</td></tr>"
+      }) -join "`n"
+    $more = if ($Set.Count -gt 250) { "<p class='none'>Showing the 250 largest of $($Set.Count). The CSV has them all.</p>" } else { '' }
+    return "<div class='scroll'><table><thead><tr><th scope='col'>Category</th>$heads<th scope='col'>Why</th></tr></thead><tbody>`n$body`n</tbody></table></div>$more"
+  }
+
+  $deleteTable = Format-DetailTable -Set $deleteRows -Empty 'Nothing is in scope for deletion on this run.'
+  $reviewTable = Format-DetailTable -Set $reviewRows -Empty 'Nothing held back for review.'
+
+  #--- by creator ---
+  $byCreator = ($Rows | Group-Object Creator | Sort-Object { ($_.Group | Measure-Object SizeGiB -Sum).Sum } -Descending | ForEach-Object {
       $gib = [math]::Round((($_.Group | Measure-Object SizeGiB -Sum).Sum), 2)
-      "<tr><td>$($_.Name)</td><td>$($_.Count)</td><td>$gib</td></tr>"
+      "<tr><td>$($_.Name)</td><td class='num'>$($_.Count)</td><td class='num'>$(Format-Gib $gib)</td></tr>"
     }) -join "`n"
 
-  $byRegion = ($Rows | Group-Object Region | Sort-Object Name | ForEach-Object {
-      $orph = @($_.Group | Where-Object { $_.Verdict -in @('Orphaned', 'StaleButInUse') })
-      $gib = [math]::Round((($orph | Measure-Object SizeGiB -Sum).Sum), 2)
-      "<tr><td>$($_.Name)</td><td>$($_.Count)</td><td>$($orph.Count)</td><td>$gib</td></tr>"
-    }) -join "`n"
+  $scopeLine = ($Totals.DeleteScope -join ', ')
+  $modeLine = if ($Totals.DeleteMode) { 'DELETE' } else { 'REPORT ONLY' }
 
   $html = @"
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>AWS Orphaned Snapshots</title>$style</head>
-<body>
-<h1>AWS Orphaned Snapshot Report</h1>
-<div class="meta">Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') &middot; script v$ScriptVersion &middot; MinAgeDays $MinAgeDays &middot; MaxAgeDays $MaxAgeDays &middot; mode: $(if ($Delete) { 'DELETE' } else { 'REPORT ONLY' })</div>
-$cards
-<h2>Snapshots by creator</h2>
-<table><thead><tr><th>Creator</th><th>Count</th><th>GiB</th></tr></thead><tbody>
-$byCreator
-</tbody></table>
-<h2>Snapshots by region</h2>
-<table><thead><tr><th>Region</th><th>Total</th><th>Orphan candidates</th><th>Reclaimable GiB</th></tr></thead><tbody>
-$byRegion
-</tbody></table>
-<h2>Orphan candidates</h2>
-<table><thead><tr><th>Account</th><th>Region</th><th>Type</th><th>Snapshot</th><th>Name</th><th>GiB</th><th>Age (days)</th><th>Creator</th><th>Verdict</th><th>Reason</th></tr></thead><tbody>
-$rowHtml
-</tbody></table>
-<div class="note">
-<strong>Before deleting:</strong> confirm that every Commvault-owned snapshot is classified as <em>Commvault</em> in the
-classification CSV. Commvault snapshot naming varies by agent and IntelliSnap configuration &mdash; adjust
-<code>-CommvaultNamePattern</code> and <code>-CommvaultTagKey</code> if any are misclassified as cloud-native.
-Cost figures are an estimate at $($Totals.Currency) $PricePerGiBMonth per GiB/month against <em>volume</em> size;
-EBS snapshots bill on changed blocks, so the real saving will usually be lower.
-$(if (-not $CheckSharing) { 'Sharing was not checked &mdash; re-run with <code>-CheckSharing</code> to exclude snapshots shared with other accounts. ' })
-<strong>Unverifiable ($($Totals.Unverifiable))</strong> are copied or imported snapshots that record no source volume id
-(AWS reports <code>vol-ffffffff</code>), so orphan status cannot be proven from the volume inventory. They are never
-auto-deleted; use <code>-TreatOldSnapshotsAsOrphaned</code> to age them out instead.
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$($Schema.Title)</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface: #fcfcfb; --plane: #f9f9f7;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
+  --grid: #e1e0d9; --rule: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --accent: #2a78d6;
+  /* Sequential blue, light surface: more capacity = darker. Ink flips once the fill goes dark. */
+  --r1: #cde2fb; --r2: #9ec5f4; --r3: #6da7ec; --r4: #3987e5; --r5: #256abf; --r6: #184f95; --r7: #0d366b;
+  --ri1: #0b0b0b; --ri2: #0b0b0b; --ri3: #0b0b0b; --ri4: #0b0b0b; --ri5: #ffffff; --ri6: #ffffff; --ri7: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface: #1a1a19; --plane: #0d0d0d;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+    --grid: #2c2c2a; --rule: #383835; --ring: rgba(255,255,255,0.10);
+    --accent: #3987e5;
+    /* Same blue ramp re-stepped for the dark surface: more capacity = brighter, not darker. */
+    --r1: #0d366b; --r2: #104281; --r3: #1c5cab; --r4: #256abf; --r5: #2a78d6; --r6: #3987e5; --r7: #6da7ec;
+    --ri1: #ffffff; --ri2: #ffffff; --ri3: #ffffff; --ri4: #ffffff; --ri5: #ffffff; --ri6: #0b0b0b; --ri7: #0b0b0b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19; --plane: #0d0d0d;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+  --grid: #2c2c2a; --rule: #383835; --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5;
+  --r1: #0d366b; --r2: #104281; --r3: #1c5cab; --r4: #256abf; --r5: #2a78d6; --r6: #3987e5; --r7: #6da7ec;
+  --ri1: #ffffff; --ri2: #ffffff; --ri3: #ffffff; --ri4: #ffffff; --ri5: #ffffff; --ri6: #0b0b0b; --ri7: #0b0b0b;
+}
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--plane); color: var(--ink);
+       margin: 0; padding: 32px 16px 64px; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 1180px; margin: 0 auto; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 15px; font-weight: 600; margin: 40px 0 2px; }
+h2 + .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
+.meta { color: var(--ink-muted); font-size: 12px; margin-bottom: 28px; }
+.meta b { color: var(--ink-2); font-weight: 600; }
+.hero { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 22px 26px; margin-bottom: 14px; }
+.hero .label { font-size: 12px; color: var(--ink-2); }
+.hero .value { font-size: 52px; font-weight: 600; line-height: 1.05; margin: 4px 0 2px; letter-spacing: -0.02em; }
+.hero .foot { font-size: 13px; color: var(--ink-2); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 14px 16px; }
+.tile .label { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 7px; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 6px; letter-spacing: -0.01em; }
+.tile .sub { font-size: 12px; color: var(--ink-muted); margin-top: 1px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; margin-right: 7px;
+       vertical-align: baseline; }
+.tile .label .dot { margin-right: 0; }
+.r1 { background: var(--r1); color: var(--ri1); } .r2 { background: var(--r2); color: var(--ri2); }
+.r3 { background: var(--r3); color: var(--ri3); } .r4 { background: var(--r4); color: var(--ri4); }
+.r5 { background: var(--r5); color: var(--ri5); } .r6 { background: var(--r6); color: var(--ri6); }
+.r7 { background: var(--r7); color: var(--ri7); }
+.scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 10px; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; background: var(--surface);
+        border: 1px solid var(--ring); border-radius: 10px; overflow: hidden; }
+th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--grid); }
+thead th { font-size: 11px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em;
+           background: var(--plane); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.heat th[scope="row"] { font-weight: 600; white-space: nowrap; display: table-cell; }
+.heat th[scope="row"] em { display: block; font-weight: 400; font-style: normal; color: var(--ink-muted); font-size: 11px; margin-top: 2px; }
+
+.heat .cell { text-align: right; font-variant-numeric: tabular-nums; border-bottom: 2px solid var(--surface);
+              border-right: 2px solid var(--surface); cursor: default; }
+.heat .cell.empty { color: var(--ink-muted); text-align: center; background: var(--plane); }
+.heat .cv { display: block; font-weight: 600; }
+.heat .cn { display: block; font-size: 11px; opacity: .72; font-weight: 400; }
+.heat td.tot { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; background: var(--plane); }
+.none { color: var(--ink-muted); font-size: 13px; background: var(--surface); border: 1px solid var(--ring);
+        border-radius: 10px; padding: 14px 16px; margin: 0; }
+.note { background: var(--surface); border: 1px solid var(--ring); border-left: 3px solid #fab219; border-radius: 8px;
+        padding: 14px 18px; font-size: 13px; color: var(--ink-2); margin-top: 32px; line-height: 1.55; }
+.note b { color: var(--ink); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--plane);
+       padding: 1px 5px; border-radius: 4px; border: 1px solid var(--grid); }
+.legend { font-size: 12px; color: var(--ink-muted); margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.legend .sw { width: 22px; height: 10px; border-radius: 2px; display: inline-block; }
+@media (max-width: 720px) {
+  .heat th[scope="row"] em { display: none; }
+  th, td { padding: 7px 8px; }
+  .hero .value { font-size: 38px; }
+  body { padding: 20px 16px 48px; }
+  /* Wide tables scroll inside their own box so the page itself never scrolls sideways. */
+  .scroll table { min-width: 640px; }
+}
+</style></head>
+<body><div class="wrap">
+
+<h1>$($Schema.Title)</h1>
+<div class="meta">
+  Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') &middot; v$ScriptVersion &middot;
+  mode <b>$modeLine</b> &middot; delete scope <b>$scopeLine</b> &middot;
+  age bars: orphaned <b>$($Totals.MinAgeDays)d</b>, source-active &amp; unverifiable <b>$($Totals.SourceActiveMinAgeDays)d</b>
 </div>
-</body></html>
+
+<div class="hero">
+  <div class="label">Reclaimable on this run</div>
+  <div class="value">$(Format-Gib $deleteGib)</div>
+  <div class="foot">$($deleteRows.Count) snapshot(s) in scope &middot; about $($Totals.Currency) $([math]::Round($deleteGib * $Totals.PricePerGiBMonth, 2)) per month &middot;
+  a further $(Format-Gib $reviewGib) across $($reviewRows.Count) snapshot(s) is held back for review</div>
+</div>
+
+<div class="tiles">
+$(($script:CategoryOrder | ForEach-Object {
+  $cat = $_
+  $g = @($Rows | Where-Object { $_.Category -eq $cat })
+  $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
+  "<div class='tile'><div class='label'><span class='dot' style='background:$($catMeta[$cat].Colour)'></span>$cat</div><div class='value'>$($g.Count)</div><div class='sub'>$(Format-Gib $gib)</div></div>"
+}) -join "`n")
+</div>
+
+<h2>Where the capacity sits</h2>
+<p class="sub">Category against age. Stronger colour means more capacity. Every cell carries its own total, so the colour is a cue rather than the only reading.</p>
+<div class="scroll"><table class="heat">
+  <thead><tr><th scope="col">Category</th>
+      $bandHeads
+      <th scope="col">Total</th></tr></thead>
+  <tbody>
+$($heatRows -join "`n")
+  </tbody>
+</table></div>
+<div class="legend"><span>Less</span>
+$((1..7 | ForEach-Object { "<span class='sw r$_'></span>" }) -join '')
+<span>More capacity</span></div>
+
+<h2>In scope for deletion &mdash; $($deleteRows.Count) snapshot(s), $(Format-Gib $deleteGib)</h2>
+<p class="sub">Exactly what <code>-Delete</code> would remove on this run. This is the set written to the candidates CSV.</p>
+$deleteTable
+
+<h2>Held back for review &mdash; $($reviewRows.Count) snapshot(s), $(Format-Gib $reviewGib)</h2>
+<p class="sub">Candidates that did not clear the age bar, or whose category is not in <code>-DeleteScope</code>. Widen the scope or lower a bar to act on these.</p>
+$reviewTable
+
+<h2>By creator</h2>
+<p class="sub">Confirm every Commvault-owned snapshot lands under <b>Commvault</b> before letting anything delete.</p>
+<div class="scroll"><table><thead><tr><th scope="col">Creator</th><th scope="col" class="num">Count</th><th scope="col" class="num">Capacity</th></tr></thead>
+<tbody>
+$byCreator
+</tbody></table></div>
+
+<div class="note">
+<b>Before deleting:</b> check the creator table above. Commvault snapshot naming varies by agent, version and
+IntelliSnap configuration, so verify every Commvault-owned snapshot is classified as <b>Commvault</b> and not as
+cloud-native. Widen <code>-CommvaultNamePattern</code> / <code>-CommvaultTagKey</code> if any are misclassified.
+<br><br>
+<b>SourceActive is not an orphan.</b> Those snapshots still have a live disk or volume behind them. They are reported
+because they are billing and usually forgotten, not because they are safe to delete. They enter the deletion scope only
+when you name them explicitly in <code>-DeleteScope</code>, and then only past the $($Totals.SourceActiveMinAgeDays) day bar.
+<br><br>
+<b>Cost is an estimate</b> at $($Totals.Currency) $($Totals.PricePerGiBMonth) per GiB/month against provisioned size.
+$($Schema.CostCaveat) Treat it as a way to prioritise, not a forecast.
+</div>
+
+</div></body></html>
 "@
 
   $html | Out-File -FilePath $Path -Encoding utf8 -WhatIf:$false
@@ -511,9 +736,9 @@ Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force -WhatIf:$false | Out-Null }
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $allCsv = Join-Path $OutputPath "AWS_Snapshots_All_$timestamp.csv"
-$orphanCsv = Join-Path $OutputPath "AWS_Snapshots_Orphaned_$timestamp.csv"
+$candidateCsv = Join-Path $OutputPath "AWS_Snapshots_Candidates_$timestamp.csv"
 $deletedCsv = Join-Path $OutputPath "AWS_Snapshots_Deleted_$timestamp.csv"
-$htmlPath = Join-Path $OutputPath "AWS_Orphaned_Snapshots_$timestamp.html"
+$htmlPath = Join-Path $OutputPath "AWS_Snapshot_Report_$timestamp.html"
 
 $results = [System.Collections.Generic.List[object]]::new()
 
@@ -525,6 +750,11 @@ if ($DeleteFromReport) {
   }
   Write-Host "[INFO] Loading approved deletion list from $DeleteFromReport" -ForegroundColor Cyan
   foreach ($row in (Import-Csv -Path $DeleteFromReport)) {
+    # A category the script never deletes must not become deletable by hand-editing the CSV.
+    if ($row.Category -in @('Protected', 'InUse')) {
+      Write-Host "[WARN] Skipping $($row.SnapshotId): category '$($row.Category)' is never deletable." -ForegroundColor Yellow
+      continue
+    }
     $results.Add([pscustomobject]@{
         AccountId    = $row.AccountId
         ProfileUsed  = $row.ProfileUsed
@@ -533,10 +763,13 @@ if ($DeleteFromReport) {
         SnapshotId   = $row.SnapshotId
         Name         = $row.Name
         SizeGiB      = [double]($row.SizeGiB)
-        AgeDays      = $row.AgeDays
+        AgeDays      = [double]($row.AgeDays)
+        AgeBand      = $row.AgeBand
         Creator      = $row.Creator
-        Verdict      = $row.Verdict
+        Category     = $row.Category
+        Action       = 'Delete'
         Reason       = $row.Reason
+        ActionNote   = 'Approved in report file'
       })
   }
 } else {
@@ -613,22 +846,26 @@ if ($DeleteFromReport) {
 
           # Only pay for the sharing call on snapshots that would otherwise be deleted.
           $isShared = $false
-          if ($CheckSharing -and -not $creatorExcluded -and -not $hasKeepTag -and -not $referenced -and $ageDays -ge $MinAgeDays -and $hasVolRef -and -not $volExists) {
+          if ($CheckSharing -and -not $creatorExcluded -and -not $hasKeepTag -and -not $referenced -and $ageDays -ge $MinAgeDays -and (-not $volExists)) {
             $isShared = Test-SnapshotShared -SnapshotId $snap.SnapshotId -CredArgs $regionArgs
           }
 
-          $verdict = Get-SnapshotVerdict `
-            -SourceVolumeExists $volExists `
-            -HasSourceVolumeReference $hasVolRef `
-            -AgeDays $ageDays `
+          $cat = Get-SnapshotCategory `
+            -SourceExists $volExists `
+            -HasSourceReference $hasVolRef `
             -ReferencedByImage $referenced `
             -HasKeepTag $hasKeepTag `
-            -IsShared $isShared `
+            -IsPinned $isShared `
+            -PinnedReason 'Shared with another account via createVolumePermission' `
             -Creator $creator `
-            -CreatorExcluded $creatorExcluded `
+            -CreatorExcluded $creatorExcluded
+
+          $act = Get-SnapshotAction `
+            -Category $cat.Category `
+            -AgeDays $ageDays `
+            -DeleteScope $DeleteScope `
             -MinAgeDays $MinAgeDays `
-            -MaxAgeDays $MaxAgeDays `
-            -TreatOldSnapshotsAsOrphaned:$TreatOldSnapshotsAsOrphaned.IsPresent
+            -SourceActiveMinAgeDays $SourceActiveMinAgeDays
 
           $tagString = (($tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
 
@@ -643,13 +880,16 @@ if ($DeleteFromReport) {
               SizeGiB           = [double]$snap.VolumeSize
               StartTime         = $snap.StartTime
               AgeDays           = [math]::Round($ageDays, 1)
+              AgeBand           = Get-AgeBand -AgeDays $ageDays
               SourceId          = $snap.VolumeId
               SourceExists      = $volExists
               ReferencedByImage = $referenced
               StorageTier       = $snap.StorageTier
               Creator           = $creator
-              Verdict           = $verdict.Verdict
-              Reason            = $verdict.Reason
+              Category          = $cat.Category
+              Action            = $act.Action
+              Reason            = $cat.Reason
+              ActionNote        = $act.Note
               Tags              = $tagString
             })
         }
@@ -692,18 +932,22 @@ if ($DeleteFromReport) {
             $ageDays = if ($created) { (New-TimeSpan -Start $created -End (Get-Date)).TotalDays } else { 0 }
             $srcExists = -not [string]::IsNullOrWhiteSpace($srcId) -and $set.Live.Contains($srcId)
 
-            $verdict = Get-SnapshotVerdict `
-              -SourceVolumeExists $srcExists `
-              -HasSourceVolumeReference (-not [string]::IsNullOrWhiteSpace($srcId)) `
-              -AgeDays $ageDays `
+            $cat = Get-SnapshotCategory `
+              -SourceExists $srcExists `
+              -HasSourceReference (-not [string]::IsNullOrWhiteSpace($srcId)) `
               -ReferencedByImage $false `
               -HasKeepTag (Test-TagKeyPresent -Tags $tags -Keys $KeepTagKey) `
-              -IsShared $false `
+              -IsPinned $false `
+              -PinnedReason '' `
               -Creator $creator `
-              -CreatorExcluded $creatorExcluded `
+              -CreatorExcluded $creatorExcluded
+
+            $act = Get-SnapshotAction `
+              -Category $cat.Category `
+              -AgeDays $ageDays `
+              -DeleteScope $DeleteScope `
               -MinAgeDays $MinAgeDays `
-              -MaxAgeDays $MaxAgeDays `
-              -TreatOldSnapshotsAsOrphaned:$TreatOldSnapshotsAsOrphaned.IsPresent
+              -SourceActiveMinAgeDays $SourceActiveMinAgeDays
 
             # RDS reports allocated storage, not consumed snapshot size.
             $sizeGiB = if ($null -ne $rsnap.AllocatedStorage) { [double]$rsnap.AllocatedStorage } else { 0 }
@@ -719,13 +963,16 @@ if ($DeleteFromReport) {
                 SizeGiB           = $sizeGiB
                 StartTime         = $created
                 AgeDays           = [math]::Round($ageDays, 1)
+                AgeBand           = Get-AgeBand -AgeDays $ageDays
                 SourceId          = $srcId
                 SourceExists      = $srcExists
                 ReferencedByImage = $false
                 StorageTier       = ''
                 Creator           = $creator
-                Verdict           = $verdict.Verdict
-                Reason            = $verdict.Reason
+                Category          = $cat.Category
+                Action            = $act.Action
+                Reason            = $cat.Reason
+                ActionNote        = $act.Note
                 Tags              = (($tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
               })
           }
@@ -741,22 +988,16 @@ if ($DeleteFromReport) {
 #----------------------------
 # Summarise
 #----------------------------
-$orphans = @($results | Where-Object { $_.Verdict -in @('Orphaned', 'StaleButInUse') })
-$orphanGiB = [math]::Round((($orphans | Measure-Object SizeGiB -Sum).Sum), 2)
-
-# Copied and imported snapshots carry no usable source volume id, so orphan status cannot be proven
-# from the volume inventory alone. They are held back unless -TreatOldSnapshotsAsOrphaned is set;
-# counting them here stops that category from being invisible.
-$unverifiable = @($results | Where-Object { $_.Verdict -eq 'Retain' -and $_.Reason -like '*cannot confirm orphan status*' })
+$toDelete = @($results | Where-Object { $_.Action -eq 'Delete' })
+$toReview = @($results | Where-Object { $_.Action -eq 'Review' })
+$deleteGiB = [math]::Round((($toDelete | Measure-Object SizeGiB -Sum).Sum), 2)
 
 $totals = @{
-  TotalSnapshots         = $results.Count
-  CloudNative            = @($results | Where-Object { $_.Creator -eq 'CloudNative' }).Count
-  Commvault              = @($results | Where-Object { $_.Creator -eq 'Commvault' }).Count
-  Unverifiable           = $unverifiable.Count
-  Orphaned               = $orphans.Count
-  OrphanedGiB            = $orphanGiB
-  EstimatedMonthlySaving = [math]::Round($orphanGiB * $PricePerGiBMonth, 2)
+  DeleteMode             = $Delete.IsPresent
+  DeleteScope            = $DeleteScope
+  MinAgeDays             = $MinAgeDays
+  SourceActiveMinAgeDays = $SourceActiveMinAgeDays
+  PricePerGiBMonth       = $PricePerGiBMonth
   Currency               = $Currency
 }
 
@@ -764,41 +1005,65 @@ if (-not $DeleteFromReport) {
   # -WhatIf:$false so a dry run still produces its reports; only the deletions are simulated.
   $results | Export-Csv -Path $allCsv -NoTypeInformation -WhatIf:$false
   Write-Host "[INFO] Full classification written to $allCsv" -ForegroundColor Green
+
+  $toDelete | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
+  $caveat = 'EBS snapshots bill on changed blocks, so the real saving is lower.'
+  if (-not $CheckSharing) { $caveat += ' Sharing was not checked - re-run with -CheckSharing to exclude snapshots shared with other accounts.' }
+  New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
+    Title      = 'AWS Snapshot Report'
+    CostCaveat = $caveat
+    Columns    = @(
+      @{ Label = 'Account'; Prop = 'AccountId' }
+      @{ Label = 'Region'; Prop = 'Region' }
+      @{ Label = 'Type'; Prop = 'SnapshotType' }
+      @{ Label = 'Snapshot'; Prop = 'SnapshotId' }
+      @{ Label = 'Name'; Prop = 'Name' }
+      @{ Label = 'GiB'; Prop = 'SizeGiB'; Numeric = $true }
+      @{ Label = 'Age (days)'; Prop = 'AgeDays'; Numeric = $true }
+      @{ Label = 'Creator'; Prop = 'Creator' }
+    )
+  }
+  Write-Host "[INFO] HTML report written to $htmlPath" -ForegroundColor Green
 }
-$orphans | Export-Csv -Path $orphanCsv -NoTypeInformation -WhatIf:$false
-New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals
 
 Write-Host ""
-Write-Host "  Snapshots scanned      : $($totals.TotalSnapshots)" -ForegroundColor White
-Write-Host "  Cloud-native           : $($totals.CloudNative)" -ForegroundColor White
-Write-Host "  Commvault (excluded)   : $($totals.Commvault)" -ForegroundColor White
-Write-Host "  Orphan candidates      : $($totals.Orphaned)" -ForegroundColor $(if ($totals.Orphaned -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host "  Reclaimable            : $orphanGiB GiB (est. $Currency $($totals.EstimatedMonthlySaving)/month)" -ForegroundColor White
-if ($unverifiable.Count -gt 0) {
-  Write-Host "  Unverifiable           : $($unverifiable.Count) (copied/imported - no source volume id; add -TreatOldSnapshotsAsOrphaned to age them out)" -ForegroundColor Yellow
+Write-Host "  Snapshots scanned   : $($results.Count)" -ForegroundColor White
+foreach ($cat in $script:CategoryOrder) {
+  $g = @($results | Where-Object { $_.Category -eq $cat })
+  if ($g.Count -eq 0) { continue }
+  $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
+  $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
+  Write-Host ("    {0,-13}: {1,5}  {2,10} GiB" -f $cat, $g.Count, $gib) -ForegroundColor $colour
 }
 Write-Host ""
-Write-Host "[INFO] Orphan list written to $orphanCsv" -ForegroundColor Green
-Write-Host "[INFO] HTML report written to $htmlPath" -ForegroundColor Green
+Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB, est. $Currency $([math]::Round($deleteGiB * $PricePerGiBMonth, 2))/month)" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host "  Held for review     : $($toReview.Count)" -ForegroundColor White
+Write-Host "  Delete scope        : $($DeleteScope -join ', ')" -ForegroundColor Gray
+Write-Host ""
+if (-not $DeleteFromReport) { Write-Host "[INFO] Deletion candidates written to $candidateCsv" -ForegroundColor Green }
 
 #----------------------------
 # Delete
 #----------------------------
 if (-not $Delete) {
-  if ($orphans.Count -gt 0) {
-    Write-Host "`n[INFO] Report-only mode. Review $orphanCsv, remove any rows you want to keep, then re-run:" -ForegroundColor Cyan
-    Write-Host "       .\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport '$orphanCsv' -Delete" -ForegroundColor Cyan
+  if ($toDelete.Count -gt 0) {
+    Write-Host "[INFO] Report-only mode. Review $candidateCsv, remove any rows you want to keep, then re-run:" -ForegroundColor Cyan
+    Write-Host "       .\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport '$candidateCsv' -Delete" -ForegroundColor Cyan
+  }
+  if ($toReview.Count -gt 0) {
+    Write-Host "[INFO] $($toReview.Count) snapshot(s) held back for review - see the Action and ActionNote columns in $allCsv" -ForegroundColor Cyan
   }
   return
 }
 
-if ($orphans.Count -eq 0) {
-  Write-Host "[INFO] Nothing to delete." -ForegroundColor Green
+if ($toDelete.Count -eq 0) {
+  Write-Host "[INFO] Nothing in scope to delete." -ForegroundColor Green
   return
 }
 
 if (-not $Force -and -not $WhatIfPreference) {
-  Write-Host "`n[WARN] About to permanently delete $($orphans.Count) snapshot(s), $orphanGiB GiB." -ForegroundColor Yellow
+  Write-Host "`n[WARN] About to permanently delete $($toDelete.Count) snapshot(s), $deleteGiB GiB." -ForegroundColor Yellow
+  Write-Host "[WARN] Categories in scope: $(($toDelete | Group-Object Category | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ')" -ForegroundColor Yellow
   $answer = Read-Host "Type DELETE to proceed"
   if ($answer -cne 'DELETE') {
     Write-Host "[INFO] Aborted. Nothing was deleted." -ForegroundColor Green
@@ -815,7 +1080,7 @@ $deleteLog = [System.Collections.Generic.List[object]]::new()
 $deleted = 0
 $failed = 0
 
-foreach ($o in ($orphans | Sort-Object ProfileUsed, Region, SnapshotId)) {
+foreach ($o in ($toDelete | Sort-Object ProfileUsed, Region, SnapshotId)) {
   if ($MaxDeletions -gt 0 -and $deleted -ge $MaxDeletions) {
     Write-Host "[INFO] MaxDeletions ($MaxDeletions) reached; stopping." -ForegroundColor Yellow
     break
@@ -824,7 +1089,7 @@ foreach ($o in ($orphans | Sort-Object ProfileUsed, Region, SnapshotId)) {
   $delArgs = @{ Region = $o.Region }
   if ($o.ProfileUsed -and $o.ProfileUsed -ne '<default credentials>') { $delArgs['ProfileName'] = $o.ProfileUsed }
 
-  $target = "$($o.Region)/$($o.SnapshotId) ($($o.SizeGiB) GiB)"
+  $target = "$($o.Region)/$($o.SnapshotId) ($($o.SizeGiB) GiB, $($o.Category))"
   if ($PSCmdlet.ShouldProcess($target, "Remove $($o.SnapshotType) snapshot")) {
     try {
       switch ($o.SnapshotType) {
@@ -835,11 +1100,11 @@ foreach ($o in ($orphans | Sort-Object ProfileUsed, Region, SnapshotId)) {
       }
       $deleted++
       Write-Host "[DELETED] $target" -ForegroundColor Magenta
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Status = 'Deleted'; Error = '' })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Status = 'Deleted'; Error = '' })
     } catch {
       $failed++
       Write-Host "[ERROR] Failed to delete $target : $($_.Exception.Message)" -ForegroundColor Red
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Status = 'Failed'; Error = $_.Exception.Message })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Status = 'Failed'; Error = $_.Exception.Message })
     }
   }
 }

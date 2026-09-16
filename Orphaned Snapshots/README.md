@@ -1,89 +1,102 @@
-# Orphaned Cloud-Native Snapshot Reporting & Cleanup
+# Cloud-Native Snapshot Reporting & Cleanup
 
-Two scripts that find — and optionally delete — **cloud-native** snapshots that nobody owns any more:
+Two scripts that classify every **cloud-native** snapshot in an estate — snapshots **not created by
+Commvault** — show where the capacity actually sits, and delete only what you explicitly put in scope.
 
-| Script | Cloud | Covers |
+| File | What it does |
+|---|---|
+| `Azure_Orphaned_Snapshots.ps1` | Azure managed disk snapshots |
+| `AWS_Orphaned_Snapshots.ps1` | AWS EBS snapshots, plus manual RDS instance/cluster snapshots |
+| `Test-SnapshotLogic.ps1` | Offline tests for the classification rules. No cloud, no credentials. |
+
+Both are **report-only by default**. Nothing is deleted unless you pass `-Delete`.
+
+---
+
+## "Orphaned" is the small half of the problem
+
+A snapshot is only literally orphaned when its source disk or volume is *gone*. That set is real, but
+it is usually not where the money is. The bigger pile is snapshots whose source is alive and well —
+someone's pre-upgrade snapshot from two years ago that nobody ever deleted. Those are not orphans, and
+calling them orphans would be wrong, but they are still billing every month.
+
+So both scripts report **five categories**, always, and never collapse them:
+
+| Category | Meaning | In the default delete scope? |
 |---|---|---|
-| `Azure_Orphaned_Snapshots.ps1` | Azure | Managed disk snapshots |
-| `AWS_Orphaned_Snapshots.ps1` | AWS | EBS snapshots, plus manual RDS instance/cluster snapshots |
+| **Orphaned** | Source disk/volume is provably gone. The literal orphan. | **Yes** |
+| **SourceActive** | Source still exists. Not an orphan — judge it on age. | No, opt in |
+| **Unverifiable** | No provable source (Azure imports; AWS `vol-ffffffff` copies). | No, opt in |
+| **InUse** | Backing a Managed Image / Gallery version / AMI. | **Never** |
+| **Protected** | Commvault, a cloud backup service, a keep-tag, a lock, or shared out. | **Never** |
 
-"Cloud-native" means **snapshots not created by Commvault**. Commvault-created snapshots are detected,
-reported, and excluded from deletion. So are snapshots belonging to the cloud providers' own backup
-services (Azure Backup, Azure Site Recovery, AWS Backup, EBS Data Lifecycle Manager) — those are
-managed on a schedule by their own policy, and deleting them breaks recovery points.
+Category is a *fact about the snapshot*. What the script would *do* about it is a separate column:
 
-Both scripts are **report-only by default**. Nothing is deleted unless you pass `-Delete`.
+| Action | Meaning |
+|---|---|
+| `Delete` | Its category is in `-DeleteScope` **and** it is past that category's age bar. |
+| `Review` | A candidate held back — wrong category for the current scope, or too young. |
+| `Keep` | `InUse` or `Protected`. Never actionable. |
 
----
+Keeping these apart means the report reads the same whatever flags you passed. Only the **Action**
+column moves. You can see your whole `SourceActive` pile without ever putting it in danger.
 
-## Why this matters
+### Two age bars, not one
 
-Snapshots are the classic silent cloud spend leak. In both clouds they outlive the thing they were
-taken from:
+| Bar | Applies to | Default |
+|---|---|---|
+| `-MinAgeDays` | `Orphaned` | 30 days |
+| `-SourceActiveMinAgeDays` | `SourceActive`, `Unverifiable` | 365 days |
 
-- **Azure** — deleting a managed disk does *not* delete its snapshots. There is no lifecycle policy on
-  snapshots, so they bill indefinitely.
-- **AWS** — deregistering an AMI does *not* delete the EBS snapshots behind it, and neither does
-  deleting a volume. This is the single most common source of orphaned snapshot spend.
-
-Neither cloud gives you a native "show me the snapshots with nothing behind them" view.
-
----
-
-## Requirements
-
-**Azure** — PowerShell 7+, and `Az.Accounts`, `Az.Compute`, `Az.Resources`.
-
-```powershell
-Install-Module Az.Accounts, Az.Compute, Az.Resources -Scope CurrentUser
-Connect-AzAccount
-```
-
-Permissions: `Reader` on the subscriptions to report. To delete, `Disk Snapshot Contributor` (or
-`Contributor`) on the scope being cleaned.
-
-**AWS** — PowerShell 7+, and `AWS.Tools.Common`, `AWS.Tools.EC2`. Add `AWS.Tools.RDS` for
-`-IncludeRdsSnapshots`, and `AWS.Tools.SecurityToken` so reports are labelled with the account id.
-
-```powershell
-Install-Module AWS.Tools.Common, AWS.Tools.EC2, AWS.Tools.SecurityToken -Scope CurrentUser
-Set-AWSCredential -AccessKey ... -SecretKey ... -StoreAs prod
-```
-
-Permissions to report: `ec2:DescribeSnapshots`, `ec2:DescribeVolumes`, `ec2:DescribeImages`,
-`ec2:DescribeRegions`, `sts:GetCallerIdentity` (plus `ec2:DescribeSnapshotAttribute` for
-`-CheckSharing`, and `rds:DescribeDB*` for RDS). To delete, add `ec2:DeleteSnapshot` and
-`rds:DeleteDBSnapshot` / `rds:DeleteDBClusterSnapshot`.
-
-Both scripts accept `-AutoInstallModules` to install what is missing.
+Deleting a snapshot whose source is provably gone is a small call. Deleting one whose disk is still
+live is a much bigger one, so it has to clear a much higher bar even after you scope it in.
 
 ---
 
-## The intended workflow
+## The workflow: report, review, then delete
 
-Report, review, then delete from the reviewed file. This keeps a human in the loop over exactly which
-snapshots go.
+Deletion is a **post-run option**, never part of the first pass.
 
 ```powershell
-# 1. Report. Deletes nothing.
+# 1. Report. Deletes nothing. Run this as often as you like.
 .\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -OutputPath .\reports
 
-# 2. Open Azure_Snapshots_Orphaned_<timestamp>.csv and DELETE ANY ROW YOU WANT TO KEEP.
-#    What is left in the file is what gets deleted.
+# 2. Open the HTML report. Check the "By creator" table, then look at the heatmap to see
+#    whether your capacity is in Orphaned or (more likely) in old SourceActive snapshots.
 
-# 3. Dry run against the approved file.
-.\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\Azure_Snapshots_Orphaned_20260916-101500.csv -Delete -WhatIf
+# 3. Open Azure_Snapshots_Candidates_<ts>.csv and DELETE ANY ROW YOU WANT TO KEEP.
+#    Whatever is left in that file is what gets deleted.
 
-# 4. Execute.
-.\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\Azure_Snapshots_Orphaned_20260916-101500.csv -Delete
+# 4. Dry run against the approved file.
+.\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\Azure_Snapshots_Candidates_20260916-101500.csv -Delete -WhatIf
+
+# 5. Execute.
+.\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\Azure_Snapshots_Candidates_20260916-101500.csv -Delete
 ```
 
-The AWS script works identically:
+`Protected` and `InUse` rows are refused even if someone pastes them into that CSV by hand.
+
+The AWS script is identical in shape:
 
 ```powershell
-.\AWS_Orphaned_Snapshots.ps1 -ProfileName prod -IncludeRdsSnapshots -OutputPath .\reports
-.\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\AWS_Snapshots_Orphaned_20260916-101500.csv -Delete
+.\AWS_Orphaned_Snapshots.ps1 -ProfileName prod -IncludeRdsSnapshots -CheckSharing -OutputPath .\reports
+.\AWS_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\AWS_Snapshots_Candidates_20260916-101500.csv -Delete
 ```
+
+### Going after the SourceActive pile
+
+Once the report has convinced you, widen the scope deliberately:
+
+```powershell
+# See what would go, without going.
+.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceActive -Delete -WhatIf
+
+# Be stricter than the default: only snapshots whose disk is alive but which are 18 months old.
+.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceActive -SourceActiveMinAgeDays 540
+```
+
+`-DeleteScope` only accepts `Orphaned`, `SourceActive` and `Unverifiable`. `Protected` and `InUse`
+cannot be named at all.
 
 ---
 
@@ -98,8 +111,9 @@ reasonable starting point, not a guarantee:
 | Azure | `^CV_`, `^cvsnap`, `_CvSnap`, `commvault`, `^GX_`, `_GX_BACKUP_` | `CV_JobId`, `CommvaultJobId`, `Commvault`, `_GX_BACKUP_`, `_GX_AMI_` |
 | AWS | as above, plus `_GX_AMI_` (matched against the `Name` tag *and* the description) | as above |
 
-Run in report mode, open `*_Snapshots_All_*.csv`, and confirm every snapshot you expect Commvault to
-own shows `Creator = Commvault`. If any show `CloudNative`, widen the patterns before you delete:
+Run in report mode, open the **By creator** table in the HTML, and confirm every snapshot you expect
+Commvault to own is counted under `Commvault`. If any show up as `CloudNative`, widen the patterns
+before you let anything delete:
 
 ```powershell
 .\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions `
@@ -111,40 +125,47 @@ Deletion is permanent. Azure snapshots and EBS snapshots cannot be recovered onc
 
 ---
 
-## How a snapshot is judged
+## What else is excluded
 
-Each snapshot gets a **Creator** and a **Verdict**, both written to the CSV with the reasoning.
-
-**Creator** — only `CloudNative` is ever a deletion candidate by default.
+Beyond Commvault, both scripts classify the cloud providers' own backup artefacts as `Protected`:
 
 | Azure | AWS |
 |---|---|
-| `Commvault` | `Commvault` |
-| `AzureBackup` (resource group `AzureBackupRG_*`) | `AwsBackup` (tag `aws:backup:*`) |
-| `SiteRecovery` (name `asr-*`) | `DlmManaged` (tag `aws:dlm:*`, or description `Created for policy: policy-*`) |
-| `CloudNative` | `AwsManaged` (owner alias `amazon` / `aws-marketplace`) |
-| | `CloudNative` |
+| Azure Backup (resource group `AzureBackupRG_*`) | AWS Backup (tag `aws:backup:*`) |
+| Azure Site Recovery (name `asr-*`) | DLM lifecycle-managed (tag `aws:dlm:*`, description `Created for policy: policy-*`) |
+| Resource locks | Snapshots shared to another account (with `-CheckSharing`) |
+| Keep-tags | AWS-managed / marketplace (owner alias `amazon`) |
 
-**Verdict**
+DLM and AWS Backup expire their own snapshots on a schedule. Deleting one out from under its policy
+breaks the recovery point *and* the policy just makes another. `-IncludeBackupServiceSnapshots` exists
+to override this, and is strongly discouraged.
 
-- **`Orphaned`** — the source disk/volume is gone, the snapshot is older than `-MinAgeDays`, nothing
-  references it, it has no keep-tag and (Azure) no resource lock. This is the safe, high-confidence case.
-- **`StaleButInUse`** — the source still exists but the snapshot is older than `-MaxAgeDays`. Only
-  produced when you pass `-TreatOldSnapshotsAsOrphaned`. Review these individually.
-- **`Retain`** — everything else, with the reason recorded.
+---
 
-A snapshot is retained if **any** of these hold: created by an excluded product; carries a keep-tag
-(`DoNotDelete`, `KeepSnapshot`, `Preserve` by default); referenced by a Managed Image / Compute Gallery
-version (Azure) or an AMI block device mapping (AWS); under a resource lock (Azure); shared with
-another account (AWS, with `-CheckSharing`); or younger than `-MinAgeDays`.
+## Requirements
 
-### "Unverifiable" snapshots
+**Azure** — PowerShell 7+, and `Az.Accounts`, `Az.Compute`, `Az.Resources`.
 
-Some snapshots record no usable source: an Azure snapshot taken from an imported blob or another
-snapshot, or an AWS copied/imported snapshot, which AWS reports as volume `vol-ffffffff`. Orphan status
-cannot be proven for these from the inventory, so they are **never auto-deleted**. They are counted
-separately in the console output and HTML report. Use `-TreatOldSnapshotsAsOrphaned` to age them out
-instead, and review the results by hand.
+```powershell
+Install-Module Az.Accounts, Az.Compute, Az.Resources -Scope CurrentUser
+Connect-AzAccount
+```
+
+Permissions: `Reader` to report. To delete, `Disk Snapshot Contributor` (or `Contributor`) on the scope.
+
+**AWS** — PowerShell 7+, and `AWS.Tools.Common`, `AWS.Tools.EC2`. Add `AWS.Tools.RDS` for
+`-IncludeRdsSnapshots`, and `AWS.Tools.SecurityToken` so reports carry the account id.
+
+```powershell
+Install-Module AWS.Tools.Common, AWS.Tools.EC2, AWS.Tools.SecurityToken -Scope CurrentUser
+Set-AWSCredential -AccessKey ... -SecretKey ... -StoreAs prod
+```
+
+To report: `ec2:DescribeSnapshots`, `ec2:DescribeVolumes`, `ec2:DescribeImages`, `ec2:DescribeRegions`,
+`sts:GetCallerIdentity` (plus `ec2:DescribeSnapshotAttribute` for `-CheckSharing`, `rds:DescribeDB*`
+for RDS). To delete, add `ec2:DeleteSnapshot` and `rds:DeleteDBSnapshot` / `rds:DeleteDBClusterSnapshot`.
+
+Both scripts accept `-AutoInstallModules`.
 
 ---
 
@@ -154,18 +175,22 @@ Written to `-OutputPath` (default: current directory), timestamped:
 
 | File | Contents |
 |---|---|
-| `*_Snapshots_All_<ts>.csv` | Every snapshot found, with creator, verdict and reasoning. Start here. |
-| `*_Snapshots_Orphaned_<ts>.csv` | Orphan candidates only — the file to review and feed to `-DeleteFromReport`. |
-| `*_Orphaned_Snapshots_<ts>.html` | Summary: totals, breakdown by creator (and by region, AWS), candidate table. |
-| `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Written only when `-Delete` runs. |
+| `*_Snapshots_All_<ts>.csv` | Every snapshot, with `Category`, `AgeBand`, `Action`, `Reason` and `ActionNote`. Start here. |
+| `*_Snapshots_Candidates_<ts>.csv` | The `Action = Delete` set — the file to review and feed to `-DeleteFromReport`. |
+| `*_Snapshot_Report_<ts>.html` | Hero total, per-category tiles, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
+| `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Only when `-Delete` runs. |
 
 Reports are always written, including under `-WhatIf`.
 
+The heatmap is the quickest read in the report: it puts capacity against age, so "most of my money is
+in `SourceActive` / `Over 365 days`" is a single glance rather than a spreadsheet exercise. It renders
+in light and dark mode and works down to phone width.
+
 ### About the cost estimate
 
-`-PricePerGiBMonth` (default `0.05`) is applied to **provisioned** size to give an order-of-magnitude
-figure. Both Azure incremental snapshots and AWS EBS snapshots bill only on changed blocks, so the real
-saving is usually lower. Treat it as a prioritisation signal, not a forecast.
+`-PricePerGiBMonth` (default `0.05`) is applied to **provisioned** size for an order-of-magnitude
+figure. Azure incremental snapshots and AWS EBS snapshots both bill only on changed blocks, so the real
+saving is usually lower. Use it to prioritise, not to forecast.
 
 ---
 
@@ -175,13 +200,13 @@ Shared by both scripts:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `-MinAgeDays` | `30` | Ignore snapshots younger than this. |
-| `-MaxAgeDays` | `365` | Age threshold for `-TreatOldSnapshotsAsOrphaned`. |
-| `-TreatOldSnapshotsAsOrphaned` | off | Also flag old snapshots whose source still exists. |
+| `-MinAgeDays` | `30` | Age bar for `Orphaned`. |
+| `-SourceActiveMinAgeDays` | `365` | Age bar for `SourceActive` and `Unverifiable`. |
+| `-DeleteScope` | `Orphaned` | Which categories `-Delete` may act on. `Protected`/`InUse` not accepted. |
 | `-CommvaultNamePattern` / `-CommvaultTagKey` | see above | Commvault detection. Tune these. |
-| `-IncludeCommvaultSnapshots` | off | Make Commvault snapshots deletable. Not recommended. |
-| `-IncludeBackupServiceSnapshots` | off | Make Azure Backup / ASR / AWS Backup / DLM snapshots deletable. Strongly discouraged. |
-| `-KeepTagKey` | `DoNotDelete`, `KeepSnapshot`, `Preserve` | Tag keys that always protect a snapshot. |
+| `-IncludeCommvaultSnapshots` | off | Move Commvault snapshots out of `Protected`. Not recommended. |
+| `-IncludeBackupServiceSnapshots` | off | Move cloud backup-service snapshots out of `Protected`. Strongly discouraged. |
+| `-KeepTagKey` | `DoNotDelete`, `KeepSnapshot`, `Preserve` | Tag keys that force `Protected`. |
 | `-Delete` | off | Actually delete. Supports `-WhatIf` / `-Confirm`. |
 | `-Force` | off | Skip the interactive `Type DELETE to proceed` gate, for scheduled runs. |
 | `-MaxDeletions` | `0` (no cap) | Stop after N successful deletions. |
@@ -200,15 +225,29 @@ runs, `-IncludeRdsSnapshots`, `-CheckSharing`.
 
 ## Scheduling
 
-For an unattended weekly cleanup, `-Force` skips the interactive gate. Keep `-MaxDeletions` set as a
-blast-radius cap, and keep the logs.
+For an unattended cleanup, `-Force` skips the interactive gate. Keep `-MaxDeletions` as a blast-radius
+cap, keep the scope narrow, and keep the logs.
 
 ```powershell
 .\AWS_Orphaned_Snapshots.ps1 -ProfileName prod -MinAgeDays 90 -Delete -Force `
   -MaxDeletions 50 -OutputPath \\fileserver\reports\snapshots
 ```
 
-Report first for several weeks before letting anything delete on a schedule.
+Report for several weeks before letting anything delete on a schedule, and do not widen
+`-DeleteScope` on a scheduled run until you have watched the `Review` list settle.
+
+---
+
+## Tests
+
+```powershell
+.\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
+```
+
+74 assertions over the category rules, precedence, age bars, delete scoping, both clouds' Commvault
+detection, Azure lock scoping and the AWS `vol-ffffffff` sentinel. It parses the two scripts to lift
+their functions out, so it never touches a cloud and needs no credentials. **Run it after changing any
+detection pattern or age bar.**
 
 ---
 
@@ -217,12 +256,14 @@ Report first for several weeks before letting anything delete on a schedule.
 - **Azure incremental snapshot chains** are handled by Azure itself — deleting one snapshot in a chain
   does not invalidate the others, so no special ordering is needed.
 - **AWS sharing** is only checked with `-CheckSharing` (one extra API call per candidate). Without it,
-  a snapshot shared to another account can be selected for deletion. Use it before any real cleanup.
-  If the sharing attribute cannot be read, the snapshot is treated as shared and retained.
+  a snapshot shared to another account can be classified as deletable. Use it before any real cleanup.
+  If the sharing attribute cannot be read, the snapshot is treated as shared and kept.
 - **Cross-account AWS runs** iterate `-ProfileName`; each profile needs its own stored credential.
-- **RDS**: only *manual* snapshots are considered. Automated snapshots are managed by RDS's own
-  retention and are excluded.
+- **RDS**: only *manual* snapshots are considered. Automated snapshots follow RDS's own retention.
+- **The classification and reporting block is byte-identical in both scripts.** They are kept
+  standalone (matching the rest of this repo) rather than sharing a module, so either can be copied to
+  a jump box on its own. If you change that block in one, change it in the other and re-run the tests.
 - **Not covered**: Azure NetApp Files snapshots, AWS FSx/Redshift/DocumentDB snapshots, orphaned AMIs
   themselves (as opposed to their snapshots), and unattached disks/volumes. Unattached Azure disks are
   already handled by `Azure Sizing/Azure_Extended.ps1`.
-- Read-only reporting is safe to run at any time. Deletion is not reversible.
+- Reporting is safe to run at any time. Deletion is not reversible.
