@@ -434,6 +434,16 @@ foreach ($pair in @(@{ File=$azureScript; First='SubscriptionName' }, @{ File=$a
   Assert-Equal "$name puts Category in the first 8 columns" (($cols.IndexOf('Category') -lt 8)) 'True'
 }
 
+# RDS is opt-in: a default run covers VM disks only, and the type breakdown stays hidden because a
+# single-valued one would just restate the total.
+$awsBody3 = Get-Content -Path $awsScript -Raw
+Assert-Equal 'RDS is a switch, so off by default' ($awsBody3 -match '\[switch\]\$IncludeRdsSnapshots') 'True'
+Assert-Equal 'RDS is only scanned when asked'     ($awsBody3 -match 'if \(-not \$IncludeRdsSnapshots\) \{ continue \}') 'True'
+Assert-Equal 'the RDS module loads only when asked' ($awsBody3 -match 'if \(\$IncludeRdsSnapshots\) \{ Import-Module AWS\.Tools\.RDS') 'True'
+Assert-Equal 'EBS and RDS are labelled apart'     ($awsBody3 -match "SnapshotType\s+= 'EBS'") 'True'
+Assert-Equal 'AWS breaks down by snapshot type'   ($awsBody3 -match "Label = 'Snapshot type'; Prop = 'SnapshotType'") 'True'
+Assert-Equal 'SnapshotType is exported per row'   ($awsBody3 -match "'SnapshotType'") 'True'
+
 #============================================================
 Write-Section 'Regressions: PowerShell collection-unrolling traps'
 #============================================================
