@@ -441,6 +441,104 @@ Refusing to delete.
 }
 
 <#
+Prints the end-of-run summary to the terminal.
+
+Written once and called at every exit point, including after a delete, so the last thing on screen is
+always what the run found and did rather than a scroll of per-snapshot output. Takes everything it
+prints as parameters so it stays cloud-agnostic and identical in both scripts.
+#>
+function Write-RunSummary {
+  param(
+    [object[]]$Rows,
+    [object[]]$ToDelete,
+    [object[]]$ToReview,
+    [string[]]$DeleteScope,
+    [string]$Currency,
+    [string[]]$Files,
+    [string]$NextStep,
+    [hashtable]$DeleteResult
+  )
+
+  $cv = @($Rows | Where-Object { $_.Ownership -eq 'Commvault' })
+  $focus = @($Rows | Where-Object { $_.Ownership -ne 'Commvault' })
+  $focusMonthly = [math]::Round([double](($focus | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+  $cvMonthly = [math]::Round([double](($cv | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+  $deleteMonthly = [math]::Round([double](($ToDelete | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+  $deleteGiB = [math]::Round([double](($ToDelete | Measure-Object SizeGiB -Sum).Sum), 2)
+
+  $rule = '  ' + ('-' * 74)
+
+  Write-Host ""
+  Write-Host $rule -ForegroundColor DarkGray
+  Write-Host "  SUMMARY" -ForegroundColor White
+  Write-Host $rule -ForegroundColor DarkGray
+  Write-Host ""
+  Write-Host ("  {0,-22}: {1}" -f 'Snapshots scanned', $Rows.Count) -ForegroundColor White
+
+  if ($cv.Count -gt 0) {
+    $cvGiB = [math]::Round([double](($cv | Measure-Object SizeGiB -Sum).Sum), 2)
+    Write-Host ("  {0,-22}: {1} snapshot(s), {2} GiB, {3}/yr - excluded from the figures below" -f `
+        'Created by Commvault', $cv.Count, $cvGiB.ToString('N0'),
+        (Format-Money -Amount ($cvMonthly * 12) -Currency $Currency)) -ForegroundColor Green
+  }
+
+  Write-Host ""
+  Write-Host "  NOT created by Commvault" -ForegroundColor White
+  foreach ($cat in $script:CategoryOrder) {
+    $g = @($focus | Where-Object { $_.Category -eq $cat })
+    if ($g.Count -eq 0) { continue }
+    $gib = [math]::Round([double](($g | Measure-Object SizeGiB -Sum).Sum), 2)
+    $mo = [math]::Round([double](($g | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+    $colour = switch ($cat) {
+      'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' }
+      'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' }
+    }
+    Write-Host ("    {0,-18} {1,5}  {2,11} GiB  {3,14} /mo  {4,14} /yr" -f `
+        $cat, $g.Count, $gib.ToString('N0'),
+        (Format-Money -Amount $mo -Currency $Currency),
+        (Format-Money -Amount ($mo * 12) -Currency $Currency)) -ForegroundColor $colour
+  }
+
+  Write-Host ""
+  Write-Host ("  {0,-22}: {1} /month   {2} /year" -f 'Potential saving',
+    (Format-Money -Amount $focusMonthly -Currency $Currency),
+    (Format-Money -Amount ($focusMonthly * 12) -Currency $Currency)) -ForegroundColor Cyan
+  Write-Host ("  {0,-22}: {1} snapshot(s), {2} GiB - worth {3}/yr" -f `
+      'In scope to delete', $ToDelete.Count, $deleteGiB.ToString('N0'),
+    (Format-Money -Amount ($deleteMonthly * 12) -Currency $Currency)) -ForegroundColor $(if ($ToDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
+  Write-Host ("  {0,-22}: {1} snapshot(s)" -f 'Held for review', $ToReview.Count) -ForegroundColor White
+  Write-Host ("  {0,-22}: {1}" -f 'Delete scope', ($DeleteScope -join ', ')) -ForegroundColor Gray
+
+  if ($DeleteResult) {
+    Write-Host ""
+    Write-Host $rule -ForegroundColor DarkGray
+    Write-Host ("  {0,-22}: {1} snapshot(s), {2} GiB" -f 'DELETED', $DeleteResult.Deleted, ([double]$DeleteResult.GiB).ToString('N0')) -ForegroundColor Magenta
+    Write-Host ("  {0,-22}: {1} /month   {2} /year" -f 'Saving realised',
+      (Format-Money -Amount $DeleteResult.Monthly -Currency $Currency),
+      (Format-Money -Amount ($DeleteResult.Monthly * 12) -Currency $Currency)) -ForegroundColor Magenta
+    if ($DeleteResult.Failed -gt 0) {
+      Write-Host ("  {0,-22}: {1} - see the deletion log" -f 'FAILED', $DeleteResult.Failed) -ForegroundColor Red
+    }
+  }
+
+  if ($Files -and $Files.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Files written" -ForegroundColor White
+    foreach ($f in $Files) { if ($f) { Write-Host "    $f" -ForegroundColor Gray } }
+  }
+
+  if ($NextStep) {
+    Write-Host ""
+    Write-Host "  Next step" -ForegroundColor White
+    Write-Host "    $NextStep" -ForegroundColor Cyan
+  }
+
+  Write-Host ""
+  Write-Host $rule -ForegroundColor DarkGray
+  Write-Host ""
+}
+
+<#
 The split the report is actually built around.
 
 A customer reading this wants one question answered: what can I remove that Commvault does not own?
@@ -918,7 +1016,7 @@ function New-HtmlReport {
   <td class="num">$(Format-Gib $gib)</td>
   <td class="num">$(Format-Money $m $Totals.Currency)</td>
   <td class="num strong">$(Format-Money ($m * 12) $Totals.Currency)</td>
-  <td class="share"><span class="bar" style="width:$([math]::Min($share, 100))%"></span><span class="pct">$share%</span></td>
+  <td class="share"><span class="track"><span class="bar" style="width:$([math]::Min($share, 100))%"></span></span><span class="pct">$share%</span></td>
   <td>$actionable</td>
 </tr>
 "@
@@ -931,7 +1029,7 @@ function New-HtmlReport {
   <td class="num">$(Format-Gib $focusGib)</td>
   <td class="num">$(Format-Money $totalMonthly $Totals.Currency)</td>
   <td class="num strong">$(Format-Money ($totalMonthly * 12) $Totals.Currency)</td>
-  <td class="share"><span class="pct">100%</span></td>
+  <td class="share"><span class="track"><span class="bar" style="width:100%"></span></span><span class="pct">100%</span></td>
   <td></td>
 </tr>
 "@
@@ -1000,11 +1098,13 @@ h2 + .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .cost tr.total th, .cost tr.total td { background: var(--plane); font-weight: 600; border-top: 2px solid var(--rule); }
 .cost th[scope="row"] { font-weight: 600; white-space: nowrap; }
 .share { min-width: 130px; }
-/* Width is a straight percentage of the cell, so the bars stay proportional to each other. No
-   max-width: clamping the top end would make a dominant category look the same as a middling one. */
-.share { display: flex; align-items: center; gap: 8px; }
-.share .bar { height: 8px; border-radius: 2px; background: var(--accent); min-width: 2px; flex: none; }
-.share .pct { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+/* A meter: fixed-width track, fill sized as a percentage of the track. Sizing the fill against the
+   cell instead would push the label out of the cell once a category passed ~80% of spend, and would
+   make bars incomparable between rows. The track is a recessive step of the same ramp. */
+.share { display: flex; align-items: center; gap: 9px; }
+.share .track { flex: 0 0 92px; height: 8px; border-radius: 2px; background: var(--r1); overflow: hidden; }
+.share .bar { display: block; height: 100%; border-radius: 2px; background: var(--accent); min-width: 2px; }
+.share .pct { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; margin-right: 7px;
        vertical-align: baseline; }
 .tile .label .dot { margin-right: 0; }
@@ -1158,7 +1258,7 @@ $deleteTable
 $reviewTable
 
 <h2>By creator &mdash; the whole estate</h2>
-<p class="sub">Every snapshot found, Commvault included, so the split above can be checked. Confirm the <b>Commvault</b> count matches what Commvault says it is protecting before letting anything delete.</p>
+<p class="sub">Every snapshot found, Commvault included, so the split above is visible in full. Commvault snapshots are identified from the markers Commvault writes onto the snapshot itself.</p>
 <div class="scroll"><table><thead><tr><th scope="col">Creator</th><th scope="col" class="num">Count</th><th scope="col" class="num">Capacity</th></tr></thead>
 <tbody>
 $byCreator
@@ -1426,52 +1526,23 @@ if (-not $DeleteFromReport) {
   }
 }
 
-$cvAll = @($results | Where-Object { $_.Ownership -eq 'Commvault' })
-# Both clouds have a confirmed Commvault marker, so both report against the non-Commvault side.
-$focusAll = @($results | Where-Object { $_.Ownership -ne 'Commvault' })
-$focusMonthly = [math]::Round([double](($focusAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
-$cvMonthlyTotal = [math]::Round([double](($cvAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+$summaryFiles = @()
+if (-not $DeleteFromReport) { $summaryFiles = @($allCsv, $candidateCsv, $costCsv, $htmlPath) }
+if ($AuditCreatorEvidence -and -not $DeleteFromReport) { $summaryFiles += $evidenceCsv }
 
-Write-Host ""
-Write-Host "  Snapshots scanned   : $($results.Count)" -ForegroundColor White
-if ($cvAll.Count -gt 0) {
-  Write-Host ("  Commvault-created   : {0} ({1} GiB, {2}/yr) - excluded from the figures below" -f `
-      $cvAll.Count, [math]::Round([double](($cvAll | Measure-Object SizeGiB -Sum).Sum), 2),
-      (Format-Money -Amount ($cvMonthlyTotal * 12) -Currency $Currency)) -ForegroundColor Green
-}
-Write-Host ""
-Write-Host "  Not Commvault-created:" -ForegroundColor White
-foreach ($cat in $script:CategoryOrder) {
-  $g = @($focusAll | Where-Object { $_.Category -eq $cat })
-  if ($g.Count -eq 0) { continue }
-  $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
-  $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
-  $mo = [math]::Round([double](($g | Measure-Object EstMonthlyCost -Sum).Sum), 2)
-  Write-Host ("    {0,-17}: {1,5}  {2,12} GiB   {3,14}/mo   {4,14}/yr" -f `
-      $cat, $g.Count, $gib.ToString('N0'), (Format-Money -Amount $mo -Currency $Currency),
-      (Format-Money -Amount ($mo * 12) -Currency $Currency)) -ForegroundColor $colour
-}
-Write-Host ""
-Write-Host "  Potential saving    : $(Format-Money -Amount $focusMonthly -Currency $Currency)/month   $(Format-Money -Amount ($focusMonthly * 12) -Currency $Currency)/year" -ForegroundColor Cyan
-Write-Host "  In scope to delete  : $($toDelete.Count) ($($deleteGiB.ToString('N0')) GiB) - saves $(Format-Money -Amount $deleteMonthly -Currency $Currency)/month, $(Format-Money -Amount ($deleteMonthly * 12) -Currency $Currency)/year" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host "  Held for review     : $($toReview.Count)" -ForegroundColor White
-Write-Host "  Delete scope        : $($DeleteScope -join ', ')" -ForegroundColor Gray
-Write-Host ""
-if (-not $DeleteFromReport) { Write-Host "[INFO] Deletion candidates written to $candidateCsv" -ForegroundColor Green }
+$nextStep = if (-not $Delete -and $toDelete.Count -gt 0) {
+  "Review $candidateCsv, remove any rows to keep, then: .\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport '<that file>' -Delete"
+} elseif (-not $Delete) {
+  'Nothing is in scope to delete. Widen -DeleteScope or lower an age bar to act on the review list.'
+} else { '' }
+
+Write-RunSummary -Rows $results -ToDelete $toDelete -ToReview $toReview -DeleteScope $DeleteScope `
+  -Currency $Currency -Files $summaryFiles -NextStep $nextStep
 
 #----------------------------
 # Delete
 #----------------------------
-if (-not $Delete) {
-  if ($toDelete.Count -gt 0) {
-    Write-Host "[INFO] Report-only mode. Review $candidateCsv, remove any rows you want to keep, then re-run:" -ForegroundColor Cyan
-    Write-Host "       .\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport '$candidateCsv' -Delete" -ForegroundColor Cyan
-  }
-  if ($toReview.Count -gt 0) {
-    Write-Host "[INFO] $($toReview.Count) snapshot(s) held back for review - see the Action and ActionNote columns in $allCsv" -ForegroundColor Cyan
-  }
-  return
-}
+if (-not $Delete) { return }
 
 if ($toDelete.Count -eq 0) {
   Write-Host "[INFO] Nothing in scope to delete." -ForegroundColor Green
@@ -1534,16 +1605,27 @@ foreach ($o in ($toDelete | Sort-Object SubscriptionId, ResourceGroupName, Name)
       Remove-AzSnapshot -ResourceGroupName $o.ResourceGroupName -SnapshotName $o.Name -Force -ErrorAction Stop | Out-Null
       $deleted++
       Write-Host "[DELETED] $target" -ForegroundColor Magenta
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstAnnualCost = $o.EstAnnualCost; Status = 'Deleted'; Error = '' })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Deleted'; Error = '' })
     } catch {
       $failed++
       Write-Host "[ERROR] Failed to delete $target : $($_.Exception.Message)" -ForegroundColor Red
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstAnnualCost = $o.EstAnnualCost; Status = 'Failed'; Error = $_.Exception.Message })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Failed'; Error = $_.Exception.Message })
     }
   }
 }
 
 if ($deleteLog.Count -gt 0) {
   $deleteLog | Export-Csv -Path $deletedCsv -NoTypeInformation -WhatIf:$false
-  Write-Host "`n[INFO] Deleted $deleted snapshot(s), $failed failure(s). Log: $deletedCsv" -ForegroundColor Green
+  $summaryFiles += $deletedCsv
+}
+
+# Print the summary again now the work is done, so the last thing on screen is the outcome rather
+# than a scroll of per-snapshot delete lines.
+$gone = @($deleteLog | Where-Object { $_.Status -eq 'Deleted' })
+Write-RunSummary -Rows $results -ToDelete $toDelete -ToReview $toReview -DeleteScope $DeleteScope `
+  -Currency $Currency -Files $summaryFiles -DeleteResult @{
+  Deleted = $deleted
+  Failed  = $failed
+  GiB     = [math]::Round([double](($gone | Measure-Object SizeGiB -Sum).Sum), 2)
+  Monthly = [math]::Round([double](($gone | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 }

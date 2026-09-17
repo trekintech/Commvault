@@ -458,6 +458,29 @@ $awsBody2 = Get-Content -Path $awsScript -Raw
 Assert-Equal 'Azure splits the two populations'      ($azBody -match 'SplitByOwnership = \$true') 'True'
 Assert-Equal 'AWS splits them too, now the marker is confirmed' ($awsBody2 -match 'SplitByOwnership = \$true') 'True'
 
+# A parameter can be silently dropped by an edit to the param block while the code that uses it
+# stays behind, which fails only at runtime and only on the path that touches it. Both scripts
+# advertise the same switches, so check each is actually declared in both.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  $name = Split-Path $script -Leaf
+  foreach ($param in @('AuditCreatorEvidence', 'AcknowledgeNoCommvaultSnapshots', 'IncludeCommvaultSnapshots',
+                       'IncludeBackupServiceSnapshots', 'KeepTagKey', 'DeleteScope', 'PriceTable',
+                       'MinAgeDays', 'SourceActiveMinAgeDays', 'MaxDeletions', 'DeleteFromReport',
+                       'PricePerGiBMonth', 'Currency', 'OutputPath', 'AutoInstallModules', 'Force')) {
+    Assert-Equal "$name declares -$param" ($body -match "(?m)^\s*(\[\w+(\[\])?\]\s*)?\`$$param\s*[,)=]") 'True'
+  }
+}
+
+# Anything the summary reads must exist on the rows both scripts build.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  $name = Split-Path $script -Leaf
+  foreach ($prop in @('Ownership', 'Category', 'Action', 'AgeBand', 'SizeGiB', 'EstMonthlyCost', 'EstAnnualCost', 'Currency')) {
+    Assert-Equal "$name populates $prop" ($body -match "(?m)^\s*$prop\s+=") 'True'
+  }
+}
+
 #============================================================
 Write-Section 'Regressions: PowerShell collection-unrolling traps'
 #============================================================
