@@ -50,11 +50,22 @@ other figure — shown so it is clear they were found, not missed.
 see where the spend sits. Each is shown both for the whole estate and excluding Commvault. A breakdown
 with only one value (a single-region estate) is skipped rather than repeating the total.
 
-### Filtering by region
+### Filtering and pivoting
 
-The per-snapshot CSVs carry `Location` + `SubscriptionName` + `ResourceGroupName` on Azure and `Region`
-+ `AccountId` + `ProfileUsed` on AWS, so they pivot by region directly. The cost summary carries
-matching `Grouping` / `Scope` rows if you want the totals without pivoting.
+**The per-snapshot CSVs are the ones to work in.** One row per snapshot, every dimension on every row,
+with the columns you filter on first:
+
+```
+Azure:  SubscriptionName, ResourceGroupName, Location, Name, Ownership, Creator, Category, Action, AgeBand, ...
+AWS:    AccountId, Region, SnapshotType, SnapshotId, Name, Ownership, Creator, Category, Action, AgeBand, ...
+```
+
+Filter by region, by category, by ownership, by age band — or drop the lot into a pivot table. Costs
+(`EstMonthlyCost`, `EstAnnualCost`, `Currency`) are on every row, so any subtotal you build is correct.
+
+`Cost_Summary` is the same data pre-aggregated to one row per combination. It is a single grain
+throughout, so it filters the same way and its cost column sums to the estate total — useful if you
+want the numbers without building a pivot.
 
 ---
 
@@ -144,7 +155,7 @@ Deletion is permanent. Snapshots cannot be recovered once removed.
 | `*_Snapshot_Report_<ts>.html` | The report. Share this. |
 | `*_Snapshots_All_<ts>.csv` | Every snapshot, with category, age, cost and reasoning. |
 | `*_Snapshots_Candidates_<ts>.csv` | The deletion list — review this, then feed it back. |
-| `*_Cost_Summary_<ts>.csv` | Cost by owner, category, age band, action **and region**. For finance. |
+| `*_Cost_Summary_<ts>.csv` | The same data pre-aggregated: one row per region × ownership × category × action × age band. |
 | `*_Snapshots_Deleted_<ts>.csv` | What was removed, and what it was costing. Only with `-Delete`. |
 | `*_Creator_Evidence_<ts>.csv` | Tags and naming found in the estate. Only with `-AuditCreatorEvidence`. |
 
