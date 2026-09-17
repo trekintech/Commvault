@@ -1719,6 +1719,9 @@ $snapshotColumns = @(
 $awsScopes = @(
   @{ Label = 'Account'; Prop = 'AccountId' }
   @{ Label = 'Region'; Prop = 'Region' }
+  # EBS vs RDS. Only ever more than one value when -IncludeRdsSnapshots is set, and a single-valued
+  # breakdown is suppressed, so a default (EBS-only) run shows no pointless "100% EBS" table.
+  @{ Label = 'Snapshot type'; Prop = 'SnapshotType' }
 )
   New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
     Title      = 'AWS Snapshot Report'

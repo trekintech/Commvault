@@ -6,7 +6,7 @@ safely.
 | File | What it does |
 |---|---|
 | `Azure_Orphaned_Snapshots.ps1` | Azure managed disk snapshots |
-| `AWS_Orphaned_Snapshots.ps1` | AWS EBS snapshots, plus manual RDS snapshots |
+| `AWS_Orphaned_Snapshots.ps1` | AWS EBS snapshots (VM disks). Manual RDS snapshots with `-IncludeRdsSnapshots`. |
 | `Test-SnapshotLogic.ps1` | Offline self-test. No cloud, no credentials. |
 
 Both scripts are **report-only by default**. Nothing is deleted unless you pass `-Delete`.
@@ -49,6 +49,26 @@ other figure — shown so it is clear they were found, not missed.
 **5. Cost by region** — and by subscription and resource group on Azure, by account on AWS — so you can
 see where the spend sits. Each is shown both for the whole estate and excluding Commvault. A breakdown
 with only one value (a single-region estate) is skipped rather than repeating the total.
+
+### What gets scanned
+
+**By default the AWS script covers VM disks only** — EBS snapshots. Databases are a separate
+conversation with a separate owner, so RDS is opt-in:
+
+```powershell
+.\AWS_Orphaned_Snapshots.ps1                          # EBS only
+.\AWS_Orphaned_Snapshots.ps1 -IncludeRdsSnapshots      # EBS + manual RDS instance and cluster snapshots
+```
+
+Every row carries a `SnapshotType` of `EBS`, `RDS-Instance` or `RDS-Cluster`, so you can filter either
+way after the fact. RDS rows have exactly the same columns as EBS rows — same categories, same age
+bands, same cost columns — so nothing special is needed to work with them.
+
+When RDS is included, the report adds a **By snapshot type** breakdown. On a default run that table is
+hidden rather than showing a pointless "100% EBS" row.
+
+Only *manual* RDS snapshots are considered. Automated ones follow RDS's own retention and are not
+yours to delete.
 
 ### Filtering and pivoting
 
@@ -214,7 +234,7 @@ Add `-AutoInstallModules` to install what is missing.
 `-ResourceGroups <wildcards>`, `-SkipGalleryCheck`.
 
 **AWS only:** `-Region <list>` (default: all), `-ProfileName <list>` for multiple accounts,
-`-IncludeRdsSnapshots`, `-CheckSharing`.
+`-IncludeRdsSnapshots` (off by default — EBS/VM disks only), `-CheckSharing`.
 
 ---
 
@@ -233,7 +253,7 @@ bar.**
 ## Not covered
 
 Azure NetApp Files, AWS FSx/Redshift/DocumentDB, orphaned AMIs themselves, and unattached disks and
-volumes. RDS covers manual snapshots only — automated ones follow RDS retention.
+volumes.
 
 The classification and reporting code is identical in both scripts, so each can be copied and run on its
 own. Change it in one, change it in the other, and re-run the tests.
