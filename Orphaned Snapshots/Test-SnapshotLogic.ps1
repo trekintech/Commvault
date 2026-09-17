@@ -347,10 +347,24 @@ Assert-Equal 'Azure ZRS is dearer'             (Get-SnapshotMonthlyCost -SizeGiB
 Assert-Equal 'an unlisted tier falls back'     (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'premium_v2' -PriceTable $tiers -DefaultPrice 0.10) 10
 Assert-Equal 'a blank tier falls back'         (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier '' -PriceTable $tiers -DefaultPrice 0.10) 10
 
-Assert-Equal 'money is grouped'      (Format-Money 11136 'USD') 'USD 11,136'
-Assert-Equal 'money rounds to whole' (Format-Money 928.44 'USD') 'USD 928'
-Assert-Equal 'millions are compact'  (Format-Money 2500000 'USD') 'USD 2.5M'
-Assert-Equal 'currency is not hardcoded' (Format-Money 1000 'GBP') 'GBP 1,000'
+# Every figure anywhere carries its currency and groups thousands, so no number can be misread as a
+# bare count or as the wrong currency.
+Assert-Equal 'thousands are grouped'     (Format-Money 11136 'USD') 'USD 11,136'
+Assert-Equal 'millions are grouped too'  (Format-Money 2500000 'USD') 'USD 2,500,000'
+Assert-Equal 'currency is never hardcoded' (Format-Money 1000 'GBP') 'GBP 1,000'
+Assert-Equal 'currency travels with zero'  (Format-Money 0 'USD') 'USD 0'
+Assert-Equal 'large amounts drop decimals' (Format-Money 928.44 'USD') 'USD 928'
+
+# A 2 GiB snapshot costs pennies a month. Rounding that to "USD 0" reads as free when it is not.
+Assert-Equal 'pennies keep their decimals' (Format-Money 0.11 'USD') 'USD 0.11'
+Assert-Equal 'small monthly costs survive' (Format-Money 6.35 'USD') 'USD 6.35'
+Assert-Equal 'the boundary rounds up'      (Format-Money 99.99 'USD') 'USD 99.99'
+Assert-Equal 'and 100 goes whole'          (Format-Money 100 'USD') 'USD 100'
+
+# Grid cells are tight, so only there do huge figures compact - and they still carry the currency.
+Assert-Equal 'cells carry the currency'    (Format-MoneyCell 18010 'USD') 'USD 18,010'
+Assert-Equal 'cells compact at millions'   (Format-MoneyCell 2500000 'USD') 'USD 2.5M'
+Assert-Equal 'cells keep pennies visible'  (Format-MoneyCell 1.32 'USD') 'USD 1.32'
 
 #============================================================
 Write-Section 'Cost summary rolls up every way the CSV needs'
@@ -432,8 +446,11 @@ $band = @($mc | Where-Object { $_.Grouping -eq 'Age band (not Commvault)' -and $
 Assert-Equal 'the age band skips the Commvault row' $band.Snapshots 1
 Assert-Equal 'and costs only the non-Commvault one' $band.EstAnnualCost 60
 
-Assert-Equal 'cells keep thousands readable'  (Format-MoneyCell 18010) '18,010'
-Assert-Equal 'cells compact only at millions' (Format-MoneyCell 2500000) '2.5M'
+# The per-snapshot CSVs name their currency in a column rather than leaving a bare number.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  Assert-Equal "$(Split-Path $script -Leaf) writes a Currency column" ($body -match 'Currency\s+= \$Currency') 'True'
+}
 
 # The two scripts differ here on purpose: Azure's marker is definitive, AWS's is not.
 $azBody = Get-Content -Path $azureScript -Raw

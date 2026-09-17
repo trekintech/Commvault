@@ -527,19 +527,30 @@ function Get-SnapshotMonthlyCost {
 }
 
 <#
-Grid cells carry money without a currency prefix - the caption states it once. Only genuinely huge
-figures compact to M, because mixing "5,875" and "18k" in the same row makes the column hard to scan.
+The single money formatter. Every figure shown anywhere carries its currency and groups thousands, so
+no number in a report or on the console can be misread as a bare count or a different currency.
+
+Small amounts keep two decimals: a 2 GiB snapshot costs pennies a month, and rounding that to "USD 0"
+reads as free when it is not. Large ones drop to whole units because the decimals are noise at that
+scale, and only genuinely huge figures compact to M, and then only in grid cells where width is tight.
 #>
-function Format-MoneyCell {
-  param([double]$Amount)
-  if ($Amount -ge 1000000) { return "$([math]::Round($Amount / 1000000, 2))M" }
-  return $Amount.ToString('N0')
+function Format-Money {
+  param(
+    [double]$Amount,
+    [string]$Currency,
+    [switch]$Compact
+  )
+
+  $n = if ($Compact -and $Amount -ge 1000000) { "$([math]::Round($Amount / 1000000, 2))M" }
+  elseif ($Amount -eq 0 -or $Amount -ge 100) { $Amount.ToString('N0') }
+  else { $Amount.ToString('N2') }
+
+  return "$Currency $n"
 }
 
-function Format-Money {
+function Format-MoneyCell {
   param([double]$Amount, [string]$Currency)
-  if ($Amount -ge 1000000) { return "$Currency $([math]::Round($Amount / 1000000, 2))M" }
-  return "$Currency $($Amount.ToString('N0'))"
+  return Format-Money -Amount $Amount -Currency $Currency -Compact
 }
 
 <#
@@ -880,7 +891,7 @@ function New-HtmlReport {
         "<td class='cell empty' title='$cat / $band&#10;nothing here'><span class='cv'>&middot;</span></td>"
       } else {
         $tip = "$cat / $band&#10;$($c.Count) snapshot(s)&#10;$(Format-Gib $c.Gib)&#10;$(Format-Money $c.Annual $Totals.Currency) per year"
-        "<td class='cell $(Get-RampClass -Fraction $frac)' title='$tip'><span class='cv'>$(Format-MoneyCell $c.Annual)</span><span class='cn'>$($c.Count)</span></td>"
+        "<td class='cell $(Get-RampClass -Fraction $frac)' title='$tip'><span class='cv'>$(Format-MoneyCell $c.Annual $Totals.Currency)</span><span class='cn'>$($c.Count)</span></td>"
       }
     }
     $rowAnnual = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Annual } | Measure-Object -Sum).Sum
@@ -889,7 +900,7 @@ function New-HtmlReport {
 <tr>
   <th scope="row"><span class="dot" style="background:$($catMeta[$cat].Colour)"></span>$cat<em>$($catMeta[$cat].Blurb)</em></th>
   $($tds -join "`n  ")
-  <td class="tot">$(Format-MoneyCell $rowAnnual)<span class="cn">$rowCount</span></td>
+  <td class="tot">$(Format-MoneyCell $rowAnnual $Totals.Currency)<span class="cn">$rowCount</span></td>
 </tr>
 "@
   }
@@ -902,7 +913,7 @@ function New-HtmlReport {
       $band = $_
       $a = ($script:CategoryOrder | ForEach-Object { $cells["$_|$band"].Annual } | Measure-Object -Sum).Sum
       $n = ($script:CategoryOrder | ForEach-Object { $cells["$_|$band"].Count } | Measure-Object -Sum).Sum
-      "<td class='tot'>$(Format-MoneyCell $a)<span class='cn'>$n</span></td>"
+      "<td class='tot'>$(Format-MoneyCell $a $Totals.Currency)<span class='cn'>$n</span></td>"
     }) -join "`n      "
   $grandAnnual = [double](($focus | Measure-Object EstAnnualCost -Sum).Sum)
 
@@ -915,13 +926,14 @@ function New-HtmlReport {
         $r = $_
         $tds = ($Schema.Columns | ForEach-Object {
             $v = $r.($_.Prop)
+            if ($_.Money) { $v = Format-Money -Amount ([double]$v) -Currency $Totals.Currency }
             $cls = if ($_.Numeric) { " class='num'" } else { '' }
             "<td$cls>$([System.Web.HttpUtility]::HtmlEncode([string]$v))</td>"
           }) -join ''
         "<tr><td><span class='dot' style='background:$($catMeta[$r.Category].Colour)'></span>$($r.Category)</td>$tds<td>$([System.Web.HttpUtility]::HtmlEncode([string]$r.Reason))</td></tr>"
       }) -join "`n"
     $more = if ($Set.Count -gt 250) { "<p class='none'>Showing the 250 largest of $($Set.Count). The CSV has them all.</p>" } else { '' }
-    return "<div class='scroll'><table><thead><tr><th scope='col'>Category</th>$heads<th scope='col'>Why</th></tr></thead><tbody>`n$body`n</tbody></table></div>$more"
+    return "<div class='scroll'><table class='detail'><thead><tr><th scope='col'>Category</th>$heads<th scope='col'>Why</th></tr></thead><tbody>`n$body`n</tbody></table></div>$more"
   }
 
   $deleteTable = Format-DetailTable -Set $deleteRows -Empty 'Nothing is in scope for deletion on this run.'
@@ -1045,6 +1057,11 @@ h2 + .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .r5 { background: var(--r5); color: var(--ri5); } .r6 { background: var(--r6); color: var(--ri6); }
 .r7 { background: var(--r7); color: var(--ri7); }
 .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 10px; }
+/* Identifiers and figures must not break mid-value; only the free-text reason wraps. The table
+   scrolls inside its own box when that makes it wider than the page. */
+.detail th, .detail td { white-space: nowrap; }
+.detail td:last-child, .detail th:last-child { white-space: normal; min-width: 150px; }
+.detail th, .detail td { padding-left: 10px; padding-right: 10px; }
 table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; background: var(--surface);
         border: 1px solid var(--ring); border-radius: 10px; overflow: hidden; }
 th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--grid); }
@@ -1158,7 +1175,7 @@ $costTotalRow
 </table></div>
 
 <h2>Cost by category and age$(if ($splitOwnership) { ' &mdash; excluding Commvault' })</h2>
-<p class="sub">Annual cost in $($Totals.Currency), with the snapshot count beneath each figure; stronger colour means more money. The bottom row is the cost of each age range across all categories. Hover a cell for its capacity.</p>
+<p class="sub">Annual cost, with the snapshot count beneath each figure; stronger colour means more money. The bottom row is the cost of each age range across all categories. Hover a cell for its capacity.</p>
 <div class="scroll"><table class="heat">
   <thead><tr><th scope="col">Category</th>
       $bandHeads
@@ -1168,7 +1185,7 @@ $($heatRows -join "`n")
   <tr class="bandtot">
     <th scope="row">All categories</th>
       $bandTotals
-    <td class="tot">$(Format-MoneyCell $grandAnnual)<span class="cn">$($focus.Count)</span></td>
+    <td class="tot">$(Format-MoneyCell $grandAnnual $Totals.Currency)<span class="cn">$($focus.Count)</span></td>
   </tr>
   </tbody>
 </table></div>
@@ -1247,6 +1264,7 @@ if ($DeleteFromReport) {
         SnapshotId   = $row.SnapshotId
         Name         = $row.Name
         SizeGiB      = [double]($row.SizeGiB)
+        Currency       = $row.Currency
         EstMonthlyCost = [double]($row.EstMonthlyCost)
         EstAnnualCost  = [double]($row.EstAnnualCost)
         AgeDays      = [double]($row.AgeDays)
@@ -1402,6 +1420,7 @@ if ($DeleteFromReport) {
               SizeGiB           = $billedGiB
               ProvisionedGiB    = $provisionedGiB
               SizeIsActual      = $sizeIsActual
+              Currency          = $Currency
               EstMonthlyCost    = $snapMonthly
               EstAnnualCost     = [math]::Round($snapMonthly * 12, 2)
               StartTime         = $snap.StartTime
@@ -1496,6 +1515,7 @@ if ($DeleteFromReport) {
                 SizeGiB           = $sizeGiB
                 ProvisionedGiB    = $sizeGiB
                 SizeIsActual      = $false
+                Currency          = $Currency
                 EstMonthlyCost    = $rdsMonthly
                 EstAnnualCost     = [math]::Round($rdsMonthly * 12, 2)
                 StartTime         = $created
@@ -1570,7 +1590,7 @@ if (-not $DeleteFromReport) {
       @{ Label = 'Snapshot'; Prop = 'SnapshotId' }
       @{ Label = 'Name'; Prop = 'Name' }
       @{ Label = 'GiB billed'; Prop = 'SizeGiB'; Numeric = $true }
-      @{ Label = "$Currency/yr"; Prop = 'EstAnnualCost'; Numeric = $true }
+      @{ Label = 'Annual cost'; Prop = 'EstAnnualCost'; Numeric = $true; Money = $true }
       @{ Label = 'Age (days)'; Prop = 'AgeDays'; Numeric = $true }
       @{ Label = 'Creator'; Prop = 'Creator' }
     )
@@ -1597,9 +1617,9 @@ $cvMonthlyTotal = [math]::Round([double](($cvAll | Measure-Object EstMonthlyCost
 Write-Host ""
 Write-Host "  Snapshots scanned   : $($results.Count)" -ForegroundColor White
 if ($cvAll.Count -gt 0) {
-  Write-Host ("  Commvault-created   : {0} ({1} GiB, {2} {3}/yr) - excluded from the figures below" -f `
-      $cvAll.Count, [math]::Round([double](($cvAll | Measure-Object SizeGiB -Sum).Sum), 2), $Currency,
-      (($cvMonthlyTotal * 12).ToString('N0'))) -ForegroundColor Green
+  Write-Host ("  Commvault-created   : {0} ({1} GiB, {2}/yr) - excluded from the figures below" -f `
+      $cvAll.Count, [math]::Round([double](($cvAll | Measure-Object SizeGiB -Sum).Sum), 2),
+      (Format-Money -Amount ($cvMonthlyTotal * 12) -Currency $Currency)) -ForegroundColor Green
 }
 Write-Host ""
 Write-Host "  Not Commvault-created:" -ForegroundColor White
@@ -1609,12 +1629,13 @@ foreach ($cat in $script:CategoryOrder) {
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
   $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
   $mo = [math]::Round([double](($g | Measure-Object EstMonthlyCost -Sum).Sum), 2)
-  Write-Host ("    {0,-17}: {1,5}  {2,10} GiB   {3,10}/mo   {4,11}/yr" -f `
-      $cat, $g.Count, $gib, "$Currency $($mo.ToString('N0'))", "$Currency $(($mo * 12).ToString('N0'))") -ForegroundColor $colour
+  Write-Host ("    {0,-17}: {1,5}  {2,12} GiB   {3,14}/mo   {4,14}/yr" -f `
+      $cat, $g.Count, $gib.ToString('N0'), (Format-Money -Amount $mo -Currency $Currency),
+      (Format-Money -Amount ($mo * 12) -Currency $Currency)) -ForegroundColor $colour
 }
 Write-Host ""
-Write-Host "  Potential saving    : $Currency $($focusMonthly.ToString('N0'))/month   $Currency $(($focusMonthly * 12).ToString('N0'))/year" -ForegroundColor Cyan
-Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB) - saves $Currency $($deleteMonthly.ToString('N0'))/month, $Currency $(($deleteMonthly * 12).ToString('N0'))/year" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host "  Potential saving    : $(Format-Money -Amount $focusMonthly -Currency $Currency)/month   $(Format-Money -Amount ($focusMonthly * 12) -Currency $Currency)/year" -ForegroundColor Cyan
+Write-Host "  In scope to delete  : $($toDelete.Count) ($($deleteGiB.ToString('N0')) GiB) - saves $(Format-Money -Amount $deleteMonthly -Currency $Currency)/month, $(Format-Money -Amount ($deleteMonthly * 12) -Currency $Currency)/year" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host "  Held for review     : $($toReview.Count)" -ForegroundColor White
 Write-Host "  Delete scope        : $($DeleteScope -join ', ')" -ForegroundColor Gray
 Write-Host ""
@@ -1654,7 +1675,7 @@ if (-not $DeleteFromReport) {
 }
 
 if (-not $Force -and -not $WhatIfPreference) {
-  Write-Host "`n[WARN] About to permanently delete $($toDelete.Count) snapshot(s), $deleteGiB GiB." -ForegroundColor Yellow
+  Write-Host "`n[WARN] About to permanently delete $($toDelete.Count) snapshot(s), $($deleteGiB.ToString('N0')) GiB, worth $(Format-Money -Amount ($deleteMonthly * 12) -Currency $Currency)/year." -ForegroundColor Yellow
   Write-Host "[WARN] Categories in scope: $(($toDelete | Group-Object Category | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ')" -ForegroundColor Yellow
   $answer = Read-Host "Type DELETE to proceed"
   if ($answer -cne 'DELETE') {
@@ -1692,11 +1713,11 @@ foreach ($o in ($toDelete | Sort-Object ProfileUsed, Region, SnapshotId)) {
       }
       $deleted++
       Write-Host "[DELETED] $target" -ForegroundColor Magenta
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Status = 'Deleted'; Error = '' })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstAnnualCost = $o.EstAnnualCost; Status = 'Deleted'; Error = '' })
     } catch {
       $failed++
       Write-Host "[ERROR] Failed to delete $target : $($_.Exception.Message)" -ForegroundColor Red
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Status = 'Failed'; Error = $_.Exception.Message })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); AccountId = $o.AccountId; Region = $o.Region; SnapshotType = $o.SnapshotType; SnapshotId = $o.SnapshotId; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstAnnualCost = $o.EstAnnualCost; Status = 'Failed'; Error = $_.Exception.Message })
     }
   }
 }

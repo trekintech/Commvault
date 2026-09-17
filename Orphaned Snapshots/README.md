@@ -245,6 +245,11 @@ in light and dark mode and works down to phone width.
 
 ### Cost
 
+Every figure in every output — report, console and CSV — carries its **currency** and groups thousands
+(`USD 13,210`), so no number can be misread as a bare count or the wrong currency. Amounts under 100
+keep two decimals (`USD 6.35`), because a small snapshot costing pennies a month should not round to
+`USD 0` and read as free. The per-snapshot CSVs carry a `Currency` column beside the cost columns.
+
 Every snapshot carries `EstMonthlyCost` and `EstAnnualCost`, and the report answers the money question
 in three places: the headline (annual cost reclaimable on this run), the per-category tiles, and the
 **cost-by-category table** — snapshots, capacity, per month, per year, share of spend, and whether the
@@ -311,7 +316,7 @@ Shared by both scripts:
 | `-PricePerGiBMonth` | `0.05` | Fallback rate per GiB/month for any tier `-PriceTable` does not name. |
 | *(AWS)* `SizeGiB` vs `ProvisionedGiB` | — | AWS costs on **full snapshot size** (what it actually bills) when the API reports it, with the volume size kept alongside for reference. |
 | `-PriceTable` | — | Per-tier rates, e.g. `@{ 'archive' = 0.0125 }`. Set these before quoting a figure. |
-| `-Currency` | `USD` | Label only; no conversion is done. |
+| `-Currency` | `USD` | Shown against every figure and written to a CSV column. Label only; no conversion is done. |
 | `-OutputPath` | `.` | Report destination. |
 | `-AutoInstallModules` | off | Install missing modules. |
 
@@ -345,7 +350,7 @@ script with `-Delete` — nobody is watching the output.
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-164 assertions over the category rules, the ownership split,, precedence, age bars, delete scoping, cost arithmetic and
+172 assertions over the category rules, the ownership split,, precedence, age bars, delete scoping, cost arithmetic and
 per-tier pricing, the cost roll-ups, the zero-detection guard,
 both clouds' Commvault markers (asserted against the real snapshot names, tags and descriptions taken
 from the Azure portal and the AWS console, with each AWS tag checked to stand alone), AMI creator
