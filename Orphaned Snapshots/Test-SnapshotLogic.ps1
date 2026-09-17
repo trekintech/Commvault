@@ -481,6 +481,50 @@ foreach ($script in @($azureScript, $awsScript)) {
   }
 }
 
+# Scope roll-ups answer "which region / subscription is this money in", which the per-snapshot CSVs
+# can be pivoted for but the cost summary previously could not.
+$scoped = @(
+  [pscustomobject]@{ Category='Orphaned'; AgeBand='Over 365 days'; Action='Delete'; Ownership='Not Commvault'
+    Region='eu-west-2'; SizeGiB=100.0; EstMonthlyCost=5.0; EstAnnualCost=60.0 }
+  [pscustomobject]@{ Category='Orphaned'; AgeBand='Over 365 days'; Action='Delete'; Ownership='Not Commvault'
+    Region='us-east-1'; SizeGiB=100.0; EstMonthlyCost=5.0; EstAnnualCost=60.0 }
+  [pscustomobject]@{ Category='Protected'; AgeBand='0-30 days'; Action='Keep'; Ownership='Commvault'
+    Region='eu-west-2'; SizeGiB=200.0; EstMonthlyCost=10.0; EstAnnualCost=120.0 }
+)
+$sc = Get-CostSummary -Rows $scoped -Currency 'USD' -ScopeProperties @(@{ Label='Region'; Prop='Region' })
+
+$euAll = @($sc | Where-Object { $_.Grouping -eq 'Region' -and $_.Scope -eq 'eu-west-2' })[0]
+Assert-Equal 'a region row exists'            ($null -ne $euAll) 'True'
+Assert-Equal 'it covers the whole region'     $euAll.Snapshots 2
+Assert-Equal 'including Commvault'            $euAll.EstAnnualCost 180
+
+# The same region, excluding Commvault - the figure a saving is quoted from.
+$euNet = @($sc | Where-Object { $_.Grouping -eq 'Region (not Commvault)' -and $_.Scope -eq 'eu-west-2' })[0]
+Assert-Equal 'a non-Commvault region row too' ($null -ne $euNet) 'True'
+Assert-Equal 'which excludes Commvault'       $euNet.Snapshots 1
+Assert-Equal 'and costs less'                 $euNet.EstAnnualCost 60
+
+$us = @($sc | Where-Object { $_.Grouping -eq 'Region' -and $_.Scope -eq 'us-east-1' })[0]
+Assert-Equal 'every region is listed'         $us.EstAnnualCost 60
+Assert-Equal 'region rows carry their scope'  (@($sc | Where-Object { $_.Grouping -like 'Region*' -and -not $_.Scope }).Count) 0
+# Region totals must reconcile with the estate total.
+$regionSum = (@($sc | Where-Object { $_.Grouping -eq 'Region' }) | Measure-Object EstAnnualCost -Sum).Sum
+$estate = @($sc | Where-Object { $_.Grouping -eq 'Total' })[0]
+Assert-Equal 'regions sum to the estate total' $regionSum $estate.EstAnnualCost
+Assert-Equal 'no scope roll-up without the map' (@((Get-CostSummary -Rows $scoped -Currency 'USD') | Where-Object { $_.Grouping -eq 'Region' }).Count) 0
+
+# Both scripts must actually pass their own scope map through.
+foreach ($pair in @(@{ File=$azureScript; Labels=@('Subscription','Region','Resource group') },
+                    @{ File=$awsScript; Labels=@('Account','Region') })) {
+  $body = Get-Content -Path $pair.File -Raw
+  $name = Split-Path $pair.File -Leaf
+  Assert-Equal "$name passes -ScopeProperties to the cost CSV" ($body -match '-ScopeProperties \$\w+Scopes') 'True'
+  Assert-Equal "$name passes ScopeProperties to the report"    ($body -match 'ScopeProperties = \$\w+Scopes') 'True'
+  foreach ($l in $pair.Labels) {
+    Assert-Equal "$name rolls up by $l" ($body -match "Label = '$([regex]::Escape($l))'") 'True'
+  }
+}
+
 #============================================================
 Write-Section 'Regressions: PowerShell collection-unrolling traps'
 #============================================================

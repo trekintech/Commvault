@@ -615,7 +615,13 @@ Grouping tells you which roll-up a row belongs to, so one file answers "what doe
 three exports or a pivot table.
 #>
 function Get-CostSummary {
-  param([object[]]$Rows, [string]$Currency)
+  param(
+    [object[]]$Rows,
+    [string]$Currency,
+    # Which row properties to roll up by, e.g. @(@{Label='Region'; Prop='Location'}). Cloud-specific,
+    # so each script names its own rather than this function guessing at column names.
+    [object[]]$ScopeProperties
+  )
 
   $out = [System.Collections.Generic.List[object]]::new()
   # Shares are of the whole set passed in, not of a filtered view - this function has no $focus.
@@ -626,6 +632,7 @@ function Get-CostSummary {
     $m = [math]::Round([double](($Set | Measure-Object EstMonthlyCost -Sum).Sum), 2)
     [pscustomobject]@{
       Grouping        = $Grouping
+      Scope           = ''
       Category        = $Category
       AgeBand         = $AgeBand
       Action          = $Action
@@ -669,6 +676,26 @@ function Get-CostSummary {
     if ($set.Count -eq 0) { continue }
     $out.Add((New-CostRow 'Action' '' '' $act $set))
   }
+  # Scope roll-ups: which subscription/account, and which region, the money sits in. Both the whole
+  # estate and the non-Commvault side, because "what does this region cost" and "what could this
+  # region save" are different questions and a customer asks both.
+  foreach ($sp in $ScopeProperties) {
+    $values = $Rows | ForEach-Object { [string]$_.($sp.Prop) } | Where-Object { $_ } | Sort-Object -Unique
+    foreach ($v in $values) {
+      $set = @($Rows | Where-Object { [string]$_.($sp.Prop) -eq $v })
+      $row = New-CostRow $sp.Label '' '' '' $set
+      $row.Scope = $v
+      $out.Add($row)
+
+      $notCv = @($set | Where-Object { $_.Ownership -ne 'Commvault' })
+      if ($notCv.Count -gt 0) {
+        $row2 = New-CostRow "$($sp.Label) (not Commvault)" '' '' '' $notCv
+        $row2.Scope = $v
+        $out.Add($row2)
+      }
+    }
+  }
+
   $out.Add((New-CostRow 'Total' '' '' '' $Rows))
 
   return $out
@@ -1260,6 +1287,36 @@ $deleteTable
 <p class="sub">Candidates that did not clear the age bar, or whose category is not in <code>-DeleteScope</code>. Widen the scope or lower a bar to act on these.</p>
 $reviewTable
 
+$(if ($Schema.ScopeProperties) {
+  ($Schema.ScopeProperties | ForEach-Object {
+    $sp = $_
+    $values = $focus | ForEach-Object { [string]$_.($sp.Prop) } | Where-Object { $_ } | Sort-Object -Unique
+    # A single-valued breakdown is just the total again, so only show it when it says something.
+    if (@($values).Count -lt 2) { return }
+    $rows = ($values | ForEach-Object {
+        $v = $_
+        $set = @($focus | Where-Object { [string]$_.($sp.Prop) -eq $v })
+        $m = [double](($set | Measure-Object EstMonthlyCost -Sum).Sum)
+        $gib = [math]::Round([double](($set | Measure-Object SizeGiB -Sum).Sum), 2)
+        $del = @($set | Where-Object { $_.Action -eq 'Delete' })
+        $delM = [double](($del | Measure-Object EstAnnualCost -Sum).Sum)
+        $share = if ($totalMonthly -gt 0) { [math]::Round(($m / $totalMonthly) * 100, 1) } else { 0 }
+        "<tr><th scope='row'>$([System.Web.HttpUtility]::HtmlEncode($v))</th><td class='num'>$($set.Count)</td><td class='num'>$(Format-Gib $gib)</td><td class='num'>$(Format-Money $m $Totals.Currency)</td><td class='num strong'>$(Format-Money ($m * 12) $Totals.Currency)</td><td class='share'><span class='track'><span class='bar' style='width:$([math]::Min($share,100))%'></span></span><span class='pct'>$share%</span></td><td class='num'>$(Format-Money $delM $Totals.Currency)</td></tr>"
+      } | Sort-Object) -join "`n"
+    @"
+<h2>By $($sp.Label.ToLower()) &mdash; excluding Commvault</h2>
+<p class="sub">Where the reclaimable spend sits. The last column is what is in scope to delete today.</p>
+<div class="scroll"><table class="cost">
+  <thead><tr><th scope="col">$($sp.Label)</th><th scope="col" class="num">Snapshots</th><th scope="col" class="num">Capacity</th>
+    <th scope="col" class="num">Per month</th><th scope="col" class="num">Per year</th>
+    <th scope="col">Share of spend</th><th scope="col" class="num">In scope /yr</th></tr></thead>
+  <tbody>
+$rows
+  </tbody></table></div>
+"@
+  }) -join "`n"
+})
+
 <h2>By creator &mdash; the whole estate</h2>
 <p class="sub">Every snapshot found, Commvault included, so the split above is visible in full. Commvault snapshots are identified from the markers Commvault writes onto the snapshot itself.</p>
 <div class="scroll"><table><thead><tr><th scope="col">Creator</th><th scope="col" class="num">Count</th><th scope="col" class="num">Capacity</th></tr></thead>
@@ -1500,8 +1557,14 @@ if (-not $DeleteFromReport) {
   Write-Host "[INFO] Full classification written to $allCsv" -ForegroundColor Green
 
   $toDelete | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
+$azureScopes = @(
+  @{ Label = 'Subscription'; Prop = 'SubscriptionName' }
+  @{ Label = 'Region'; Prop = 'Location' }
+  @{ Label = 'Resource group'; Prop = 'ResourceGroupName' }
+)
   New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
     Title       = 'Azure Snapshot Report'
+    ScopeProperties = $azureScopes
     # Commvault's Azure marker is definitive, so the two populations can be separated honestly.
     SplitByOwnership = $true
     CostCaveat  = 'Incremental snapshots bill on consumed delta, so the real saving for those is lower.'
@@ -1519,7 +1582,8 @@ if (-not $DeleteFromReport) {
   Write-Host "[INFO] HTML report written to $htmlPath" -ForegroundColor Green
 
   $costCsv = Join-Path $OutputPath "Azure_Cost_Summary_$timestamp.csv"
-  Get-CostSummary -Rows $results -Currency $Currency | Export-Csv -Path $costCsv -NoTypeInformation -WhatIf:$false
+  Get-CostSummary -Rows $results -Currency $Currency -ScopeProperties $azureScopes |
+    Export-Csv -Path $costCsv -NoTypeInformation -WhatIf:$false
   Write-Host "[INFO] Cost summary written to $costCsv" -ForegroundColor Green
 
   if ($AuditCreatorEvidence) {
@@ -1608,11 +1672,11 @@ foreach ($o in ($toDelete | Sort-Object SubscriptionId, ResourceGroupName, Name)
       Remove-AzSnapshot -ResourceGroupName $o.ResourceGroupName -SnapshotName $o.Name -Force -ErrorAction Stop | Out-Null
       $deleted++
       Write-Host "[DELETED] $target" -ForegroundColor Magenta
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Deleted'; Error = '' })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Location = $o.Location; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Deleted'; Error = '' })
     } catch {
       $failed++
       Write-Host "[ERROR] Failed to delete $target : $($_.Exception.Message)" -ForegroundColor Red
-      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Failed'; Error = $_.Exception.Message })
+      $deleteLog.Add([pscustomobject]@{ Timestamp = (Get-Date); SubscriptionName = $o.SubscriptionName; ResourceGroupName = $o.ResourceGroupName; Location = $o.Location; Name = $o.Name; SizeGiB = $o.SizeGiB; Category = $o.Category; Currency = $Currency; EstMonthlyCost = $o.EstMonthlyCost; EstAnnualCost = $o.EstAnnualCost; Status = 'Failed'; Error = $_.Exception.Message })
     }
   }
 }
