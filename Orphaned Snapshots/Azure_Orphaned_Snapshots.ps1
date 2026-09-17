@@ -441,6 +441,25 @@ Refusing to delete.
 }
 
 <#
+The split the report is actually built around.
+
+A customer reading this wants one question answered: what can I remove that Commvault does not own?
+So ownership is the top-level partition, and everything analytic - tiles, cost, age bands, candidate
+lists - is computed on the non-Commvault population alone. Commvault's own snapshots are reported
+separately and briefly: found, counted, costed, and explicitly excluded from the savings figures, so
+nobody has to wonder whether they were missed or quietly included.
+
+This is deliberately not the same thing as the Protected category, which also holds Azure Backup,
+Site Recovery, keep-tagged and locked snapshots. Those are not Commvault's and a customer still wants
+to see them, so they stay in the main analysis.
+#>
+function Get-SnapshotOwnership {
+  param([string]$Creator)
+  if ($Creator -eq 'Commvault') { return 'Commvault' }
+  return 'Not Commvault'
+}
+
+<#
 Monthly cost of one snapshot.
 
 Storage tier matters more than any other input here: an AWS archive-tier snapshot is roughly a
@@ -463,6 +482,16 @@ function Get-SnapshotMonthlyCost {
   return [math]::Round($SizeGiB * $rate, 2)
 }
 
+<#
+Grid cells carry money without a currency prefix - the caption states it once. Only genuinely huge
+figures compact to M, because mixing "5,875" and "18k" in the same row makes the column hard to scan.
+#>
+function Format-MoneyCell {
+  param([double]$Amount)
+  if ($Amount -ge 1000000) { return "$([math]::Round($Amount / 1000000, 2))M" }
+  return $Amount.ToString('N0')
+}
+
 function Format-Money {
   param([double]$Amount, [string]$Currency)
   if ($Amount -ge 1000000) { return "$Currency $([math]::Round($Amount / 1000000, 2))M" }
@@ -480,6 +509,7 @@ function Get-CostSummary {
   param([object[]]$Rows, [string]$Currency)
 
   $out = [System.Collections.Generic.List[object]]::new()
+  # Shares are of the whole set passed in, not of a filtered view - this function has no $focus.
   $totalMonthly = [double](($Rows | Measure-Object EstMonthlyCost -Sum).Sum)
 
   function New-CostRow {
@@ -499,10 +529,24 @@ function Get-CostSummary {
     }
   }
 
+  foreach ($own in @('Not Commvault', 'Commvault')) {
+    $set = @($Rows | Where-Object { $_.Ownership -eq $own })
+    if ($set.Count -eq 0) { continue }
+    $row = New-CostRow 'Ownership' '' '' '' $set
+    $row.Category = $own
+    $out.Add($row)
+  }
   foreach ($cat in $script:CategoryOrder) {
     $set = @($Rows | Where-Object { $_.Category -eq $cat })
     if ($set.Count -eq 0) { continue }
     $out.Add((New-CostRow 'Category' $cat '' '' $set))
+  }
+  # Age bands for the non-Commvault population - the "cost per range" the report leads on.
+  foreach ($band in $script:AgeBandOrder) {
+    $set = @($Rows | Where-Object { $_.AgeBand -eq $band -and $_.Ownership -ne 'Commvault' })
+    if ($set.Count -eq 0) { continue }
+    $row = New-CostRow 'Age band (not Commvault)' '' $band '' $set
+    $out.Add($row)
   }
   foreach ($cat in $script:CategoryOrder) {
     foreach ($band in $script:AgeBandOrder) {
@@ -738,24 +782,37 @@ function New-HtmlReport {
 
   $enc = { param([string]$s) [System.Web.HttpUtility]::HtmlEncode($s) }
 
+  #--- ownership split: the analysis is about what Commvault does NOT own ---
+  # Where Commvault cannot be identified reliably (AWS today) the schema turns the split off and the
+  # whole estate is reported as one population, with a banner saying so. Claiming a clean separation
+  # we cannot actually make would be worse than not splitting at all.
+  $splitOwnership = [bool]$Schema.SplitByOwnership
+  $cvRows = if ($splitOwnership) { @($Rows | Where-Object { $_.Ownership -eq 'Commvault' }) } else { @() }
+  $focus = if ($splitOwnership) { @($Rows | Where-Object { $_.Ownership -ne 'Commvault' }) } else { @($Rows) }
+
+  $cvGib = [math]::Round([double](($cvRows | Measure-Object SizeGiB -Sum).Sum), 2)
+  $cvMonthly = [double](($cvRows | Measure-Object EstMonthlyCost -Sum).Sum)
+
   #--- headline ---
-  $deleteRows = @($Rows | Where-Object { $_.Action -eq 'Delete' })
-  $reviewRows = @($Rows | Where-Object { $_.Action -eq 'Review' })
+  $deleteRows = @($focus | Where-Object { $_.Action -eq 'Delete' })
+  $reviewRows = @($focus | Where-Object { $_.Action -eq 'Review' })
   $deleteGib = [math]::Round((($deleteRows | Measure-Object SizeGiB -Sum).Sum), 2)
   $reviewGib = [math]::Round((($reviewRows | Measure-Object SizeGiB -Sum).Sum), 2)
   $deleteMonthly = [double](($deleteRows | Measure-Object EstMonthlyCost -Sum).Sum)
   $reviewMonthly = [double](($reviewRows | Measure-Object EstMonthlyCost -Sum).Sum)
-  $totalMonthly = [double](($Rows | Measure-Object EstMonthlyCost -Sum).Sum)
+  $totalMonthly = [double](($focus | Measure-Object EstMonthlyCost -Sum).Sum)
+  $focusGib = [math]::Round([double](($focus | Measure-Object SizeGiB -Sum).Sum), 2)
 
   #--- category x age heatmap ---
   $cells = @{}
   $maxCell = 0.0
   foreach ($cat in $script:CategoryOrder) {
     foreach ($band in $script:AgeBandOrder) {
-      $g = @($Rows | Where-Object { $_.Category -eq $cat -and $_.AgeBand -eq $band })
+      $g = @($focus | Where-Object { $_.Category -eq $cat -and $_.AgeBand -eq $band })
       $gib = [double]([math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2))
-      $cells["$cat|$band"] = [pscustomobject]@{ Count = $g.Count; Gib = $gib }
-      if ($gib -gt $maxCell) { $maxCell = $gib }
+      $annual = [double](($g | Measure-Object EstAnnualCost -Sum).Sum)
+      $cells["$cat|$band"] = [pscustomobject]@{ Count = $g.Count; Gib = $gib; Annual = $annual }
+      if ($annual -gt $maxCell) { $maxCell = $annual }
     }
   }
 
@@ -768,32 +825,42 @@ function New-HtmlReport {
     'SourceActive'     = @{ Colour = '#fab219'; Blurb = 'Attached to a live machine. Still billing.' }
     'Unverifiable'     = @{ Colour = '#4a3aa7'; Blurb = 'No provable source. Needs a human.' }
     'InUse'            = @{ Colour = '#2a78d6'; Blurb = 'Backing a live image. Leave alone.' }
-    'Protected'        = @{ Colour = '#0ca30c'; Blurb = 'Commvault, backup service, keep-tag or lock.' }
+    'Protected'        = @{ Colour = '#0ca30c'; Blurb = $(if ($splitOwnership) { 'Backup service, keep-tag or lock.' } else { 'Commvault, backup service, keep-tag or lock.' }) }
   }
 
   $heatRows = foreach ($cat in $script:CategoryOrder) {
     $tds = foreach ($band in $script:AgeBandOrder) {
       $c = $cells["$cat|$band"]
-      $frac = if ($maxCell -gt 0) { $c.Gib / $maxCell } else { 0 }
+      $frac = if ($maxCell -gt 0) { $c.Annual / $maxCell } else { 0 }
       if ($c.Count -eq 0) {
         "<td class='cell empty' title='$cat / $band&#10;nothing here'><span class='cv'>&middot;</span></td>"
       } else {
-        $tip = "$cat / $band&#10;$($c.Count) snapshot(s)&#10;$(Format-Gib $c.Gib)"
-        "<td class='cell $(Get-RampClass -Fraction $frac)' title='$tip'><span class='cv'>$(Format-Gib $c.Gib)</span><span class='cn'>$($c.Count)</span></td>"
+        $tip = "$cat / $band&#10;$($c.Count) snapshot(s)&#10;$(Format-Gib $c.Gib)&#10;$(Format-Money $c.Annual $Totals.Currency) per year"
+        "<td class='cell $(Get-RampClass -Fraction $frac)' title='$tip'><span class='cv'>$(Format-MoneyCell $c.Annual)</span><span class='cn'>$($c.Count)</span></td>"
       }
     }
-    $rowGib = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Gib } | Measure-Object -Sum).Sum
+    $rowAnnual = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Annual } | Measure-Object -Sum).Sum
     $rowCount = ($script:AgeBandOrder | ForEach-Object { $cells["$cat|$_"].Count } | Measure-Object -Sum).Sum
     @"
 <tr>
   <th scope="row"><span class="dot" style="background:$($catMeta[$cat].Colour)"></span>$cat<em>$($catMeta[$cat].Blurb)</em></th>
   $($tds -join "`n  ")
-  <td class="tot">$(Format-Gib $rowGib)<span class="cn">$rowCount</span></td>
+  <td class="tot">$(Format-MoneyCell $rowAnnual)<span class="cn">$rowCount</span></td>
 </tr>
 "@
   }
 
   $bandHeads = ($script:AgeBandOrder | ForEach-Object { "<th scope='col'>$_</th>" }) -join "`n      "
+
+  # Column totals. "What is this age range costing me" is a question the grid cannot answer without
+  # them, and it is the one that usually drives the decision to act.
+  $bandTotals = ($script:AgeBandOrder | ForEach-Object {
+      $band = $_
+      $a = ($script:CategoryOrder | ForEach-Object { $cells["$_|$band"].Annual } | Measure-Object -Sum).Sum
+      $n = ($script:CategoryOrder | ForEach-Object { $cells["$_|$band"].Count } | Measure-Object -Sum).Sum
+      "<td class='tot'>$(Format-MoneyCell $a)<span class='cn'>$n</span></td>"
+    }) -join "`n      "
+  $grandAnnual = [double](($focus | Measure-Object EstAnnualCost -Sum).Sum)
 
   #--- detail tables ---
   function Format-DetailTable {
@@ -826,7 +893,7 @@ function New-HtmlReport {
   # hold a lot of GiB on a cheap tier, or little on an expensive one.
   $costRows = ($script:CategoryOrder | ForEach-Object {
       $cat = $_
-      $g = @($Rows | Where-Object { $_.Category -eq $cat })
+      $g = @($focus | Where-Object { $_.Category -eq $cat })
       if ($g.Count -eq 0) { return }
       $gib = [math]::Round([double](($g | Measure-Object SizeGiB -Sum).Sum), 2)
       $m = [double](($g | Measure-Object EstMonthlyCost -Sum).Sum)
@@ -848,8 +915,8 @@ function New-HtmlReport {
   $costTotalRow = @"
 <tr class="total">
   <th scope="row">Total</th>
-  <td class="num">$($Rows.Count)</td>
-  <td class="num">$(Format-Gib ([math]::Round([double](($Rows | Measure-Object SizeGiB -Sum).Sum), 2)))</td>
+  <td class="num">$($focus.Count)</td>
+  <td class="num">$(Format-Gib $focusGib)</td>
   <td class="num">$(Format-Money $totalMonthly $Totals.Currency)</td>
   <td class="num strong">$(Format-Money ($totalMonthly * 12) $Totals.Currency)</td>
   <td class="share"><span class="pct">100%</span></td>
@@ -952,6 +1019,16 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .heat td.tot { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; background: var(--plane); }
 .none { color: var(--ink-muted); font-size: 13px; background: var(--surface); border: 1px solid var(--ring);
         border-radius: 10px; padding: 14px 16px; margin: 0; }
+.cvpanel { background: var(--surface); border: 1px solid var(--ring); border-left: 3px solid #0ca30c;
+           border-radius: 10px; margin: 14px 0 0; overflow: hidden; }
+.cvpanel.warn { border-left-color: #fab219; }
+.cvhead { font-size: 13px; font-weight: 600; padding: 12px 16px 0; display: flex; align-items: center; }
+.cvbody { padding: 10px 16px 14px; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 28px; }
+.cvstat .v { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+.cvstat .l { font-size: 11px; color: var(--ink-muted); text-transform: uppercase; letter-spacing: .04em; }
+.cvnote { font-size: 12px; color: var(--ink-2); margin: 0; flex: 1 1 320px; line-height: 1.55; }
+.heat tr.bandtot th, .heat tr.bandtot td { background: var(--plane); border-top: 2px solid var(--rule);
+                                           font-weight: 600; }
 .note { background: var(--surface); border: 1px solid var(--ring); border-left: 3px solid #fab219; border-radius: 8px;
         padding: 14px 18px; font-size: 13px; color: var(--ink-2); margin-top: 32px; line-height: 1.55; }
 .note b { color: var(--ink); }
@@ -978,25 +1055,52 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 </div>
 
 <div class="hero">
-  <div class="label">Reclaimable on this run</div>
-  <div class="value">$(Format-Money ($deleteMonthly * 12) $Totals.Currency)<span class="unit"> / year</span></div>
-  <div class="foot"><b>$(Format-Money $deleteMonthly $Totals.Currency) per month</b> &middot; $(Format-Gib $deleteGib) across $($deleteRows.Count) snapshot(s) in scope<br>
-  a further <b>$(Format-Money ($reviewMonthly * 12) $Totals.Currency) per year</b> ($(Format-Gib $reviewGib), $($reviewRows.Count) snapshot(s)) is held back for review &middot;
-  total estate $(Format-Money ($totalMonthly * 12) $Totals.Currency) per year</div>
+  <div class="label">$(if ($splitOwnership) { 'Potentially reclaimable &mdash; snapshots Commvault did not create' } else { 'Potentially reclaimable' })</div>
+  <div class="value">$(Format-Money ($totalMonthly * 12) $Totals.Currency)<span class="unit"> / year</span></div>
+  <div class="foot"><b>$(Format-Money $totalMonthly $Totals.Currency) per month</b> across $($focus.Count) snapshot(s), $(Format-Gib $focusGib).
+  Of that, <b>$(Format-Money ($deleteMonthly * 12) $Totals.Currency)/year</b> ($($deleteRows.Count) snapshot(s)) is in scope to delete today and
+  <b>$(Format-Money ($reviewMonthly * 12) $Totals.Currency)/year</b> ($($reviewRows.Count) snapshot(s)) needs a decision first.</div>
 </div>
+
+$(if ($splitOwnership) {
+@"
+<div class="cvpanel">
+  <div class="cvhead"><span class="dot" style="background:#0ca30c"></span>Commvault-created snapshots &mdash; found and excluded</div>
+  <div class="cvbody">
+    <div class="cvstat"><div class="v">$($cvRows.Count)</div><div class="l">snapshots</div></div>
+    <div class="cvstat"><div class="v">$(Format-Gib $cvGib)</div><div class="l">capacity</div></div>
+    <div class="cvstat"><div class="v">$(Format-Money ($cvMonthly * 12) $Totals.Currency)</div><div class="l">per year</div></div>
+    <p class="cvnote">These are Commvault's own backup snapshots. They are <b>not</b> a saving &mdash; deleting them breaks
+    recovery points &mdash; and they are excluded from every figure elsewhere in this report. Listed here so it is clear
+    they were found rather than missed.</p>
+  </div>
+</div>
+"@
+} else {
+@"
+<div class="cvpanel warn">
+  <div class="cvhead"><span class="dot" style="background:#fab219"></span>Commvault snapshots are not separated in this report</div>
+  <div class="cvbody">
+    <p class="cvnote">Commvault's marker for this cloud is not confirmed, so the whole estate is reported as one
+    population and the figures below <b>may include Commvault-created snapshots</b>. Confirm the marker with
+    <code>-AuditCreatorEvidence</code> before treating these totals as a saving.</p>
+  </div>
+</div>
+"@
+})
 
 <div class="tiles">
 $(($script:CategoryOrder | ForEach-Object {
   $cat = $_
-  $g = @($Rows | Where-Object { $_.Category -eq $cat })
+  $g = @($focus | Where-Object { $_.Category -eq $cat })
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
   $m = [double](($g | Measure-Object EstMonthlyCost -Sum).Sum)
   "<div class='tile'><div class='label'><span class='dot' style='background:$($catMeta[$cat].Colour)'></span>$cat</div><div class='value'>$($g.Count)</div><div class='sub'>$(Format-Gib $gib)</div><div class='cost'>$(Format-Money ($m * 12) $Totals.Currency)/yr</div></div>"
 }) -join "`n")
 </div>
 
-<h2>What it costs, by category</h2>
-<p class="sub">Where the money actually goes. <b>In scope</b> is what <code>-Delete</code> would remove on this run; <b>Opt in</b> needs naming in <code>-DeleteScope</code>; <b>Never</b> is not deletable at all.</p>
+<h2>What it costs, by category$(if ($splitOwnership) { ' &mdash; excluding Commvault' })</h2>
+<p class="sub">Where the money goes, and how much of it is actually available. <b>In scope</b> is what <code>-Delete</code> would remove on this run; <b>Opt in</b> needs naming in <code>-DeleteScope</code>; <b>Never</b> is not deletable at all (Azure Backup, Site Recovery, keep-tags and locks live here).</p>
 <div class="scroll"><table class="cost">
   <thead><tr>
     <th scope="col">Category</th><th scope="col" class="num">Snapshots</th><th scope="col" class="num">Capacity</th>
@@ -1009,19 +1113,24 @@ $costTotalRow
   </tbody>
 </table></div>
 
-<h2>Where the capacity sits</h2>
-<p class="sub">Category against age. Stronger colour means more capacity. Every cell carries its own total, so the colour is a cue rather than the only reading.</p>
+<h2>Cost by category and age$(if ($splitOwnership) { ' &mdash; excluding Commvault' })</h2>
+<p class="sub">Annual cost in $($Totals.Currency), with the snapshot count beneath each figure; stronger colour means more money. The bottom row is the cost of each age range across all categories. Hover a cell for its capacity.</p>
 <div class="scroll"><table class="heat">
   <thead><tr><th scope="col">Category</th>
       $bandHeads
       <th scope="col">Total</th></tr></thead>
   <tbody>
 $($heatRows -join "`n")
+  <tr class="bandtot">
+    <th scope="row">All categories</th>
+      $bandTotals
+    <td class="tot">$(Format-MoneyCell $grandAnnual)<span class="cn">$($focus.Count)</span></td>
+  </tr>
   </tbody>
 </table></div>
 <div class="legend"><span>Less</span>
 $((1..7 | ForEach-Object { "<span class='sw r$_'></span>" }) -join '')
-<span>More capacity</span></div>
+<span>More cost</span></div>
 
 <h2>In scope for deletion &mdash; $($deleteRows.Count) snapshot(s), $(Format-Gib $deleteGib)</h2>
 <p class="sub">Exactly what <code>-Delete</code> would remove on this run. This is the set written to the candidates CSV.</p>
@@ -1031,8 +1140,8 @@ $deleteTable
 <p class="sub">Candidates that did not clear the age bar, or whose category is not in <code>-DeleteScope</code>. Widen the scope or lower a bar to act on these.</p>
 $reviewTable
 
-<h2>By creator</h2>
-<p class="sub">Confirm every Commvault-owned snapshot lands under <b>Commvault</b> before letting anything delete.</p>
+<h2>By creator &mdash; the whole estate</h2>
+<p class="sub">Every snapshot found, Commvault included, so the split above can be checked. Confirm the <b>Commvault</b> count matches what Commvault says it is protecting before letting anything delete.</p>
 <div class="scroll"><table><thead><tr><th scope="col">Creator</th><th scope="col" class="num">Count</th><th scope="col" class="num">Capacity</th></tr></thead>
 <tbody>
 $byCreator
@@ -1104,6 +1213,7 @@ if ($DeleteFromReport) {
         AgeDays           = [double]($row.AgeDays)
         AgeBand           = $row.AgeBand
         Creator           = $row.Creator
+        Ownership         = $row.Ownership
         Category          = $row.Category
         Action            = 'Delete'
         Reason            = $row.Reason
@@ -1231,6 +1341,7 @@ if ($DeleteFromReport) {
           # -AuditCreatorEvidence template it alongside AWS's native description field.
           Description       = $(if ($snap.Tags -and $snap.Tags['Description']) { $snap.Tags['Description'] } else { '' })
           Creator           = $creator
+          Ownership         = Get-SnapshotOwnership -Creator $creator
           Category          = $cat.Category
           Action            = $act.Action
           Reason            = $cat.Reason
@@ -1269,6 +1380,8 @@ if (-not $DeleteFromReport) {
   $toDelete | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
   New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
     Title       = 'Azure Snapshot Report'
+    # Commvault's Azure marker is definitive, so the two populations can be separated honestly.
+    SplitByOwnership = $true
     CostCaveat  = 'Incremental snapshots bill on consumed delta, so the real saving for those is lower.'
     Columns     = @(
       @{ Label = 'Subscription'; Prop = 'SubscriptionName' }
@@ -1294,10 +1407,22 @@ if (-not $DeleteFromReport) {
   }
 }
 
+$cvAll = @($results | Where-Object { $_.Ownership -eq 'Commvault' })
+$focusAll = if ($true) { @($results | Where-Object { $_.Ownership -ne 'Commvault' }) } else { @($results) }
+$focusMonthly = [math]::Round([double](($focusAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+$cvMonthlyTotal = [math]::Round([double](($cvAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+
 Write-Host ""
 Write-Host "  Snapshots scanned   : $($results.Count)" -ForegroundColor White
+if ($cvAll.Count -gt 0) {
+  Write-Host ("  Commvault-created   : {0} ({1} GiB, {2} {3}/yr) - excluded from the figures below" -f `
+      $cvAll.Count, [math]::Round([double](($cvAll | Measure-Object SizeGiB -Sum).Sum), 2), $Currency,
+      (($cvMonthlyTotal * 12).ToString('N0'))) -ForegroundColor Green
+}
+Write-Host ""
+Write-Host "  Not Commvault-created:" -ForegroundColor White
 foreach ($cat in $script:CategoryOrder) {
-  $g = @($results | Where-Object { $_.Category -eq $cat })
+  $g = @($focusAll | Where-Object { $_.Category -eq $cat })
   if ($g.Count -eq 0) { continue }
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
   $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
@@ -1306,7 +1431,7 @@ foreach ($cat in $script:CategoryOrder) {
       $cat, $g.Count, $gib, "$Currency $($mo.ToString('N0'))", "$Currency $(($mo * 12).ToString('N0'))") -ForegroundColor $colour
 }
 Write-Host ""
-Write-Host "  Estate total        : $Currency $($estateMonthly.ToString('N0'))/month   $Currency $(($estateMonthly * 12).ToString('N0'))/year" -ForegroundColor White
+Write-Host "  Potential saving    : $Currency $($focusMonthly.ToString('N0'))/month   $Currency $(($focusMonthly * 12).ToString('N0'))/year" -ForegroundColor Cyan
 Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB) - saves $Currency $($deleteMonthly.ToString('N0'))/month, $Currency $(($deleteMonthly * 12).ToString('N0'))/year" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host "  Held for review     : $($toReview.Count)" -ForegroundColor White
 Write-Host "  Delete scope        : $($DeleteScope -join ', ')" -ForegroundColor Gray

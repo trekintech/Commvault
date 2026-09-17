@@ -13,6 +13,26 @@ Both are **report-only by default**. Nothing is deleted unless you pass `-Delete
 
 ---
 
+## What this report is for
+
+**Showing a customer what they could save by deleting snapshots Commvault did not create.**
+
+A customer's estate usually contains Commvault's own backup snapshots alongside everything else.
+Those are not a saving — deleting them breaks recovery points. So the report does two things:
+
+1. **Identifies Commvault-created snapshots and sets them aside.** They get their own panel at the
+   top — count, capacity, annual cost — and are excluded from every other figure. Shown, not hidden,
+   so it is obvious they were found rather than missed.
+2. **Analyses everything else in full** — the actual opportunity. Category, whether the source disk is
+   still attached to a live machine, age range, and cost per category and per range.
+
+Everything below the Commvault panel is the non-Commvault population. The headline number is what
+that population costs per year.
+
+> **AWS is reported as one population for now.** Commvault's AWS marker is observed rather than
+> confirmed, so the AWS report does not split, and says so in a banner: its totals may include
+> Commvault snapshots. Azure's marker is definitive, so Azure splits cleanly.
+
 ## "Orphaned" is the small half of the problem
 
 A snapshot is only literally orphaned when its source disk or volume is *gone*. That set is real, but
@@ -217,7 +237,7 @@ Written to `-OutputPath` (default: current directory), timestamped:
 |---|---|
 | `*_Snapshots_All_<ts>.csv` | Every snapshot, with `Category`, `AgeBand`, `Action`, `Reason` and `ActionNote`. Start here. |
 | `*_Snapshots_Candidates_<ts>.csv` | The `Action = Delete` set — the file to review and feed to `-DeleteFromReport`. |
-| `*_Snapshot_Report_<ts>.html` | Annual-cost headline, per-category tiles, a **cost-by-category table**, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
+| `*_Snapshot_Report_<ts>.html` | Annual-cost headline, the **Commvault panel**, per-category tiles, a **cost-by-category table**, a **cost by category × age grid** with per-age-range totals, the in-scope and held-for-review tables, and a whole-estate by-creator breakdown. |
 | `*_Cost_Summary_<ts>.csv` | Cost rolled up by category, by category × age, and by action, with monthly, annual and share-of-spend. |
 | `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Only when `-Delete` runs. |
 | `*_Creator_Evidence_<ts>.csv` | Tag pairs, tag keys, name prefixes and masked description templates. Only with `-AuditCreatorEvidence`. |
@@ -240,6 +260,8 @@ one file, so a finance conversation does not need a pivot table:
 
 | Grouping | Rows |
 |---|---|
+| `Ownership` | Commvault vs Not Commvault — the headline split |
+| `Age band (not Commvault)` | cost per age range, excluding Commvault |
 | `Category` | one per category |
 | `Category x Age` | each category split across the age bands |
 | `Action` | `Delete` (what this run actually saves), `Review`, `Keep` |
@@ -328,7 +350,7 @@ account before scheduling the AWS script with `-Delete`** — nobody is watching
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-143 assertions over the category rules, precedence, age bars, delete scoping, cost arithmetic and
+159 assertions over the category rules, the ownership split,, precedence, age bars, delete scoping, cost arithmetic and
 per-tier pricing, the cost roll-ups, the zero-detection guard,
 both clouds' Commvault markers (asserted against the real snapshot name, tags and description taken
 from the Azure portal and the AWS console), AMI creator inheritance, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,

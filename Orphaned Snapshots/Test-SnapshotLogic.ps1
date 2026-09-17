@@ -65,7 +65,8 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
         'Get-AgeBand', 'Get-SnapshotCategory', 'Get-SnapshotAction', 'Get-RampClass', 'Format-Gib',
         'Test-MatchAnyPattern', 'Test-TagMatch', 'Test-TagKeyPresent', 'Get-AzSnapshotCreator',
         'Test-ResourceGroupFilter', 'Test-IsLocked', 'Test-CommvaultDetection', 'Get-CreatorEvidence',
-        'Get-DescriptionTemplate', 'Get-SnapshotMonthlyCost', 'Format-Money', 'Get-CostSummary'))))
+        'Get-DescriptionTemplate', 'Get-SnapshotMonthlyCost', 'Format-Money', 'Format-MoneyCell',
+        'Get-CostSummary', 'Get-SnapshotOwnership'))))
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
@@ -379,6 +380,51 @@ Assert-Equal 'age breakdown carries cost' $byAge.EstAnnualCost 180
 Assert-Equal 'every row names its currency' (@($cost | Where-Object { $_.Currency -ne 'USD' }).Count) 0
 # An empty category must not appear as a zero row and dilute the table.
 Assert-Equal 'empty categories are omitted' (@($cost | Where-Object { $_.Grouping -eq 'Category' }).Count) 2
+
+#============================================================
+Write-Section 'Ownership: the split the report is built on'
+#============================================================
+# The report answers "what can I remove that Commvault does not own", so ownership is the top-level
+# partition and everything analytic is computed on the non-Commvault side.
+Assert-Equal 'Commvault is its own population'   (Get-SnapshotOwnership -Creator 'Commvault') 'Commvault'
+Assert-Equal 'cloud-native is not Commvault'     (Get-SnapshotOwnership -Creator 'CloudNative') 'Not Commvault'
+# Azure Backup and Site Recovery are Protected but they are NOT Commvault's, so a customer still sees
+# them in the main analysis rather than having them folded into the Commvault panel.
+Assert-Equal 'Azure Backup is not Commvault'     (Get-SnapshotOwnership -Creator 'AzureBackup') 'Not Commvault'
+Assert-Equal 'Site Recovery is not Commvault'    (Get-SnapshotOwnership -Creator 'SiteRecovery') 'Not Commvault'
+Assert-Equal 'AWS Backup is not Commvault'       (Get-SnapshotOwnership -Creator 'AwsBackup') 'Not Commvault'
+Assert-Equal 'DLM is not Commvault'              (Get-SnapshotOwnership -Creator 'DlmManaged') 'Not Commvault'
+
+# Cost roll-ups must keep the two populations apart, or the savings figure quietly includes Commvault.
+$mixed = @(
+  [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
+    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
+  [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
+    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
+  [pscustomobject]@{ Category = 'Protected'; AgeBand = '0-30 days'; Action = 'Keep'
+    Ownership = 'Commvault'; SizeGiB = 200.0; EstMonthlyCost = 10.0 }
+)
+$mc = Get-CostSummary -Rows $mixed -Currency 'USD'
+$notCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Not Commvault' })[0]
+$isCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Commvault' })[0]
+Assert-Equal 'non-Commvault annual is reported'  $notCv.EstAnnualCost 120
+Assert-Equal 'Commvault annual is reported too'  $isCv.EstAnnualCost 120
+Assert-Equal 'non-Commvault covers 2 snapshots'  $notCv.Snapshots 2
+Assert-Equal 'Commvault covers 1'                $isCv.Snapshots 1
+
+# Age-band rows drive "cost per range" in the report, and must exclude Commvault.
+$band = @($mc | Where-Object { $_.Grouping -eq 'Age band (not Commvault)' -and $_.AgeBand -eq '0-30 days' })[0]
+Assert-Equal 'the age band skips the Commvault row' $band.Snapshots 1
+Assert-Equal 'and costs only the non-Commvault one' $band.EstAnnualCost 60
+
+Assert-Equal 'cells keep thousands readable'  (Format-MoneyCell 18010) '18,010'
+Assert-Equal 'cells compact only at millions' (Format-MoneyCell 2500000) '2.5M'
+
+# The two scripts differ here on purpose: Azure's marker is definitive, AWS's is not.
+$azBody = Get-Content -Path $azureScript -Raw
+$awsBody2 = Get-Content -Path $awsScript -Raw
+Assert-Equal 'Azure splits the two populations'      ($azBody -match 'SplitByOwnership = \$true') 'True'
+Assert-Equal 'AWS reports the estate as one for now' ($awsBody2 -match 'SplitByOwnership = \$false') 'True'
 
 #============================================================
 Write-Section 'Regressions: PowerShell collection-unrolling traps'
