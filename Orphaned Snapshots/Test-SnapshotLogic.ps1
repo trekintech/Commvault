@@ -65,14 +65,17 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
         'Get-AgeBand', 'Get-SnapshotCategory', 'Get-SnapshotAction', 'Get-RampClass', 'Format-Gib',
         'Test-MatchAnyPattern', 'Test-TagMatch', 'Test-TagKeyPresent', 'Get-AzSnapshotCreator',
         'Test-ResourceGroupFilter', 'Test-IsLocked', 'Test-CommvaultDetection', 'Get-CreatorEvidence',
-        'Import-KnownCommvaultId'))))
+        'Get-DescriptionTemplate', 'Get-SnapshotMonthlyCost', 'Format-Money', 'Format-MoneyCell',
+        'Get-CostSummary', 'Get-SnapshotOwnership'))))
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
-  'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference')
+  'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference', 'Get-BackedAmiId')
 . ([scriptblock]::Create($awsText))
 
-$CategoryOrder = @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+# The shared functions read these at script scope, exactly as they do inside the real scripts.
+$CategoryOrder = @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+$AgeBandOrder = @('0-30 days', '31-90 days', '91-365 days', 'Over 365 days')
 
 Write-Host "Snapshot logic tests" -ForegroundColor Green
 
@@ -90,10 +93,14 @@ Assert-Equal 'day 366' (Get-AgeBand 366) 'Over 365 days'
 #============================================================
 Write-Section 'Category assignment and its precedence order'
 #============================================================
-$live = @{ SourceExists = $true; HasSourceReference = $true; ReferencedByImage = $false; HasKeepTag = $false
-  IsPinned = $false; PinnedReason = ''; Creator = 'CloudNative'; CreatorExcluded = $false
+$live = @{ SourceExists = $true; SourceAttached = $true; HasSourceReference = $true; ReferencedByImage = $false
+  HasKeepTag = $false; IsPinned = $false; PinnedReason = ''; Creator = 'CloudNative'; CreatorExcluded = $false
 }
-Assert-Equal 'source alive -> SourceActive' ((Get-SnapshotCategory @live).Category) 'SourceActive'
+Assert-Equal 'source alive and attached -> SourceActive' ((Get-SnapshotCategory @live).Category) 'SourceActive'
+
+# The case the report is really for: the VM was deleted but its disk was left behind.
+$t = $live.Clone(); $t.SourceAttached = $false
+Assert-Equal 'source exists but unattached -> SourceUnattached' ((Get-SnapshotCategory @t).Category) 'SourceUnattached'
 
 $t = $live.Clone(); $t.SourceExists = $false
 Assert-Equal 'source gone -> Orphaned' ((Get-SnapshotCategory @t).Category) 'Orphaned'
@@ -114,8 +121,8 @@ $t = $live.Clone(); $t.IsPinned = $true; $t.PinnedReason = 'lock'
 Assert-Equal 'lock or share -> Protected' ((Get-SnapshotCategory @t).Category) 'Protected'
 
 # Precedence matters: a snapshot can satisfy several rules at once and must land on the safest.
-$all = @{ SourceExists = $false; HasSourceReference = $true; ReferencedByImage = $true; HasKeepTag = $true
-  IsPinned = $true; PinnedReason = 'lock'; Creator = 'Commvault'; CreatorExcluded = $true
+$all = @{ SourceExists = $false; SourceAttached = $false; HasSourceReference = $true; ReferencedByImage = $true
+  HasKeepTag = $true; IsPinned = $true; PinnedReason = 'lock'; Creator = 'Commvault'; CreatorExcluded = $true
 }
 Assert-Equal 'Protected outranks everything' ((Get-SnapshotCategory @all).Category) 'Protected'
 $t = $all.Clone(); $t.CreatorExcluded = $false; $t.HasKeepTag = $false; $t.IsPinned = $false
@@ -151,16 +158,21 @@ Assert-Equal 'InUse survives max scope and zero bars'     ((Get-SnapshotAction -
 #============================================================
 Write-Section 'Azure: who created this snapshot'
 #============================================================
-$cvName = @('^CV_', '^cvsnap', '_CvSnap', 'commvault', '^GX_', '_GX_BACKUP_')
-$cvTag = @('CV_JobId', 'CommvaultJobId', 'Commvault', '_GX_BACKUP_', '_GX_AMI_')
-function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null, $Known = $null, $Id = '')
-  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Id $Id -Tags $Tags `
-    -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
+$cvName = @('COMMVAULT', 'GXMD_SNAP')
+$cvTag = @('Commvault')
+function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null)
+  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Tags $Tags `
+    -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag
 }
-Assert-Equal 'CV_ name prefix'        (AzCreator 'CV_disk1_snap') 'Commvault'
-Assert-Equal 'case-insensitive match' (AzCreator 'myCOMMVAULTsnap') 'Commvault'
-Assert-Equal 'commvault tag key'      (AzCreator 'snap-2024' 'rg1' @{'CV_JobId' = '12345' }) 'Commvault'
-Assert-Equal 'commvault tag value'    (AzCreator 'snap-2024' 'rg1' @{'CreatedBy' = 'Commvault' }) 'Commvault'
+# The real thing, taken verbatim from an Azure portal snapshot blade.
+$realName = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab'
+$realTags = @{ 'CreatedBy' = 'Commvault'; 'Description' = 'Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]' }
+Assert-Equal 'a real Commvault snapshot, name and tags' (AzCreator $realName 'SAASFAST' $realTags) 'Commvault'
+Assert-Equal 'its name alone is conclusive'             (AzCreator $realName) 'Commvault'
+Assert-Equal 'its tags alone are conclusive'            (AzCreator 'renamed-by-hand' 'rg1' $realTags) 'Commvault'
+Assert-Equal 'the GXMD_SNAP suffix also catches it'     (AzCreator 'something_GXMD_SNAP_ab12') 'Commvault'
+Assert-Equal 'case does not matter'                     (AzCreator 'thing_commvault_snap') 'Commvault'
+Assert-Equal 'CreatedBy=Commvault tag value'            (AzCreator 'snap-2024' 'rg1' @{'CreatedBy' = 'Commvault' }) 'Commvault'
 Assert-Equal 'Azure Backup RG'        (AzCreator 'snap-x' 'AzureBackupRG_westeurope_1') 'AzureBackup'
 Assert-Equal 'Site Recovery name'     (AzCreator 'asr-abc-123') 'SiteRecovery'
 Assert-Equal 'genuinely cloud-native' (AzCreator 'manual-snap-before-patch' 'rg1' @{'env' = 'prod' }) 'CloudNative'
@@ -188,14 +200,60 @@ $ht = ConvertTo-TagHashtable -Tags @((Tag 'Name' 'web01'), (Tag 'env' 'prod'))
 Assert-Equal 'AWS tag list becomes a hashtable' $ht['Name'] 'web01'
 Assert-Equal 'null tag list is empty'           ((ConvertTo-TagHashtable -Tags $null).Count) 0
 
-$awsCvName = $cvName + @('_GX_AMI_')
-function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Known = $null, $SnapId = '')
-  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -SnapshotId $SnapId `
-    -CommvaultNamePattern $awsCvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
+# AWS keeps its own, still-unverified pattern set - deliberately NOT Azure's confirmed markers,
+# because no AWS equivalent of the COMMVAULT name stamp has been identified yet.
+$awsCvName = @('^SP_\d+_\d+_\d+_\d+', 'commvault', '_GX_BACKUP_', '_GX_AMI_')
+$awsCvTag = @('commvault', '_GX_BACKUP_')
+function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Image = $null)
+  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -ImageInfo $Image `
+    -CommvaultNamePattern $awsCvName -CommvaultTagKey $awsCvTag
 }
-Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'CV_vol_snap')))) 'Commvault'
+# The real thing, taken verbatim from an AWS console snapshot page - every tag it actually carries.
+$realAwsDesc = 'Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156'
+$realAwsTags = ConvertTo-TagHashtable @(
+  (Tag 'commvault:vendor' 'Commvault')
+  (Tag 'commvault:createdBy' 'Commvault Cloud (M036)')
+  (Tag 'Description' 'Snapshot_created_by_Commvault_for_job_8465372_at_1789636362._Source_Volume_vol-089fa2758cd9cb01e_from_lsp01036c1us01')
+  (Tag '_GX_BACKUP_' '')
+  (Tag 'Name' 'SP_2_8465372_40229960_1789636362')
+)
+Assert-Equal 'a real Commvault EBS snapshot' (AwsCreator $realAwsDesc $realAwsTags) 'Commvault'
+
+# Each marker has to stand alone, so losing or renaming any one tag does not lose the snapshot.
+Assert-Equal 'commvault:vendor alone'    (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'commvault:vendor' 'Commvault')))) 'Commvault'
+Assert-Equal 'commvault:createdBy alone' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'commvault:createdBy' 'Commvault Cloud (M036)')))) 'Commvault'
+Assert-Equal 'the Description tag alone' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Description' 'Snapshot_created_by_Commvault_for_job_1_at_2._Source_Volume_vol-3')))) 'Commvault'
+Assert-Equal '_GX_BACKUP_ with no value' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag '_GX_BACKUP_' '')))) 'Commvault'
+Assert-Equal 'the SP_ Name tag alone'    (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_2_8465372_40229960_1789636362')))) 'Commvault'
+
+# The NATIVE description field is AWS boilerplate from CreateImage. Commvault's own wording lives in
+# a Description TAG, which is a different thing - the native field proves nothing on its own.
+Assert-Equal 'the native description is not a marker' (AwsCreator $realAwsDesc @{}) 'CloudNative'
+Assert-Equal 'an untagged snapshot stays cloud-native' (AwsCreator 'manual snap' @{}) 'CloudNative'
+# A bare SP_ prefix is too loose to be the marker; the full structure is what identifies it.
+Assert-Equal 'SP_ without the full structure is not matched' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_backup')))) 'CloudNative'
+Assert-Equal 'SP_ with the full structure matches'          (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_9_1234567_7654321_1700000000')))) 'Commvault'
+
+# Commvault drives CreateImage, so an anonymous-looking snapshot inherits from the AMI above it.
+$cvImage = [pscustomobject]@{ ImageId = 'ami-0891867df96c9f156'; Name = 'Commvault_GX_AMI_8465372'; NameTag = ''; TagText = '' }
+$plainImage = [pscustomobject]@{ ImageId = 'ami-1111'; Name = 'golden-ubuntu-2204'; NameTag = ''; TagText = 'env=prod' }
+Assert-Equal 'inherits Commvault from its AMI name' (AwsCreator $realAwsDesc @{} '' $cvImage) 'Commvault'
+Assert-Equal 'inherits from the AMI Name tag' `
+  (AwsCreator $realAwsDesc @{} '' ([pscustomobject]@{ ImageId = 'ami-2'; Name = ''; NameTag = 'CV_GX_AMI_1'; TagText = '' })) 'Commvault'
+Assert-Equal 'inherits from the AMI tags' `
+  (AwsCreator $realAwsDesc @{} '' ([pscustomobject]@{ ImageId = 'ami-3'; Name = ''; NameTag = ''; TagText = 'CreatedBy=Commvault' })) 'Commvault'
+Assert-Equal 'an ordinary AMI confers nothing'  (AwsCreator $realAwsDesc @{} '' $plainImage) 'CloudNative'
+Assert-Equal 'no AMI at all is handled'         (AwsCreator $realAwsDesc @{} '' $null) 'CloudNative'
+
+Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'cv_vol_commvault_snap')))) 'Commvault'
 Assert-Equal 'commvault in description' (AwsCreator 'Created by Commvault IntelliSnap') 'Commvault'
 Assert-Equal '_GX_BACKUP_ tag'          (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag '_GX_BACKUP_' 'true')))) 'Commvault'
+
+# Pulling the AMI id back out of AWS's description - it survives deregistration, which is what makes
+# the classic "AMI was deleted, snapshots were not" case provable rather than inferred.
+Assert-Equal 'extracts the AMI id'        (Get-BackedAmiId $realAwsDesc) 'ami-0891867df96c9f156'
+Assert-Equal 'no AMI in a plain description' (Get-BackedAmiId 'manual snapshot before patching') ''
+Assert-Equal 'empty description is safe'     (Get-BackedAmiId '') ''
 Assert-Equal 'AWS Backup reserved tag'  (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'aws:backup:source-resource' 'vol-1')))) 'AwsBackup'
 Assert-Equal 'AWS Backup description'   (AwsCreator 'AWS Backup service point-in-time') 'AwsBackup'
 Assert-Equal 'DLM reserved tag'         (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'aws:dlm:lifecycle-policy-id' 'policy-1')))) 'DlmManaged'
@@ -228,117 +286,252 @@ Assert-Equal 'rolls over to TiB'          (Format-Gib 2048) '2 TiB'
 
 
 #============================================================
-Write-Section 'Authoritative Commvault list overrides the patterns'
-#============================================================
-# The whole point: a snapshot named nothing like Commvault, carrying no Commvault tag, is still
-# Commvault if the export from Commvault says so.
-$known = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-[void]$known.Add('weird-legacy-name-2019')
-[void]$known.Add('/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id')
-
-Assert-Equal 'unmatched name is cloud-native without the list' (AzCreator 'weird-legacy-name-2019') 'CloudNative'
-Assert-Equal 'the list reclassifies it as Commvault'           (AzCreator 'weird-legacy-name-2019' 'rg1' $null $known) 'Commvault'
-Assert-Equal 'matching by full resource id also works'         (AzCreator 'anything' 'rg1' $null $known '/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id') 'Commvault'
-Assert-Equal 'list matching is case-insensitive'               (AzCreator 'WEIRD-LEGACY-NAME-2019' 'rg1' $null $known) 'Commvault'
-Assert-Equal 'a name not on the list is unaffected'            (AzCreator 'some-other-snap' 'rg1' $null $known) 'CloudNative'
-Assert-Equal 'AWS: snapshot id on the list'                    (AwsCreator 'x' @{} '' $known 'weird-legacy-name-2019') 'Commvault'
-Assert-Equal 'AWS: id not on the list'                         (AwsCreator 'x' @{} '' $known 'snap-0abc') 'CloudNative'
-
-#============================================================
 Write-Section 'The zero-detection guard'
 #============================================================
 # Finding no Commvault snapshots at all, in an estate with snapshots, means the patterns probably
 # missed. That must stop a delete rather than sail through it.
-Assert-Equal 'some Commvault found -> proceed'   ((Test-CommvaultDetection -CommvaultCount 12 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
-Assert-Equal 'none found -> BLOCKED'             ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'False'
-Assert-Equal 'none found but acknowledged'       ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $true -HasAuthoritativeList $false).Proceed) 'True'
-Assert-Equal 'empty estate is not suspicious'    ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 0 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
-# An authoritative list that matched nothing is still worth stopping for - the list may be wrong too.
-Assert-Equal 'list supplied but matched nothing -> BLOCKED' ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $true).Proceed) 'False'
-Assert-Equal 'the block explains how to fix it'  (([string](Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Message) -match 'CommvaultSnapshotIdFile') 'True'
+Assert-Equal 'some Commvault found -> proceed'   ((Test-CommvaultDetection -CommvaultCount 12 -TotalCount 300 -Acknowledged $false).Proceed) 'True'
+Assert-Equal 'none found -> BLOCKED'             ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false).Proceed) 'False'
+Assert-Equal 'none found but acknowledged'       ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $true).Proceed) 'True'
+Assert-Equal 'empty estate is not suspicious'    ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 0 -Acknowledged $false).Proceed) 'True'
+Assert-Equal 'the block explains how to fix it'  (([string](Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false).Message) -match 'AuditCreatorEvidence') 'True'
 
 #============================================================
-Write-Section 'Creator evidence for building patterns from the real estate'
+Write-Section 'Evidence gathering: finding a marker you do not know yet'
 #============================================================
+# Descriptions carry job ids and timestamps, so raw values are all unique and tell you nothing.
+# Masking the variable parts collapses one code path into one counted template - which is how you
+# spot a product marker in a cloud where you have not yet identified one.
+$realDesc = 'Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]'
+$otherDesc = 'Created by jobID [8462024] at [09/17/2026,11:22:01] from [mas02036c1us02]'
+Assert-Equal 'two runs of the same job collapse together' `
+  ((Get-DescriptionTemplate $realDesc) -eq (Get-DescriptionTemplate $otherDesc)) 'True'
+Assert-Equal 'the identifying wording survives masking' `
+  ((Get-DescriptionTemplate $realDesc) -match 'Created by jobID') 'True'
+Assert-Equal 'digits are masked'    ((Get-DescriptionTemplate $realDesc) -notmatch '8462023') 'True'
+Assert-Equal 'guids are masked'     (Get-DescriptionTemplate 'vol 3f2504e0-4f89-11d3-9a0c-0305e82c3301') 'vol <guid>'
+Assert-Equal 'a different product stays distinct' `
+  ((Get-DescriptionTemplate $realDesc) -ne (Get-DescriptionTemplate 'Created for policy: policy-0abc123')) 'True'
+
 $sample = @(
-  [pscustomobject]@{ Name = 'CV_sql_snap_1'; Tags = 'CV_JobId=99; env=prod'; Creator = 'Commvault' }
-  [pscustomobject]@{ Name = 'CV_sql_snap_2'; Tags = 'CV_JobId=98'; Creator = 'Commvault' }
-  [pscustomobject]@{ Name = 'manual-before-patch'; Tags = 'env=prod'; Creator = 'CloudNative' }
-  [pscustomobject]@{ Name = 'weird_legacy_thing'; Tags = ''; Creator = 'CloudNative' }
+  [pscustomobject]@{ Name = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab'
+    Tags = 'CreatedBy=Commvault; Description=' + $realDesc; Description = $realDesc; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462024_COMMVAULT_GXMD_SNAP_9ff01c'
+    Tags = 'CreatedBy=Commvault; Description=' + $otherDesc; Description = $otherDesc; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'manual-before-patch'; Tags = 'env=prod'; Description = ''; Creator = 'CloudNative' }
+  [pscustomobject]@{ Name = 'weird_legacy_thing'; Tags = ''; Description = ''; Creator = 'CloudNative' }
 )
 $ev = Get-CreatorEvidence -Rows $sample
-Assert-Equal 'finds the CV_JobId tag key'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })).Count) 1
-Assert-Equal 'counts that tag key'          ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })[0]).Count) 2
-Assert-Equal 'finds the env tag key'        ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'env' })).Count) 1
-Assert-Equal 'finds the CV name prefix'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'CV' })[0]).Count) 2
-Assert-Equal 'splits on underscore too'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'weird' })).Count) 1
-Assert-Equal 'empty tags do not break it'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
-
+Assert-Equal 'reports the CreatedBy tag key'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CreatedBy' })).Count) 1
+# This is the row that hands you the marker on a plate.
+Assert-Equal 'reports CreatedBy=Commvault as a pair' ((@($ev | Where-Object { $_.Evidence -eq 'TagPair' -and $_.Value -eq 'CreatedBy=Commvault' })[0]).Count) 2
+Assert-Equal 'a per-snapshot value is not a marker'  ((@($ev | Where-Object { $_.Evidence -eq 'TagPair' -and $_.Value -like 'Description=*8462023*' })).Count) 0
+Assert-Equal 'templates the description'             ((@($ev | Where-Object { $_.Evidence -eq 'DescriptionPattern' })[0]).Count) 2
+Assert-Equal 'finds the name prefix'                 ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'linuxbgwsc2' })[0]).Count) 2
+Assert-Equal 'empty tags do not break it'            ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
 
 #============================================================
-Write-Section 'Regression: collections must survive being returned'
+Write-Section 'Cost: per-tier rates, monthly and annual'
 #============================================================
-# PowerShell enumerates a collection on the way out of a function, so a bare "return $set" hands back
-# $null for an empty set and a plain array otherwise - losing the type and the case-insensitive
-# comparer. Every .Contains() downstream then throws or silently turns case-sensitive. The fix is
-# "return , $set"; these assertions stop it regressing.
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "cv-ids-$([guid]::NewGuid()).txt"
+# Deliberately round numbers so the arithmetic can be checked by eye.
+Assert-Equal '100 GiB at 0.05 = 5.00/mo'  (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier '' -PriceTable $null -DefaultPrice 0.05) 5
+Assert-Equal '1024 GiB at 0.05 = 51.20'   (Get-SnapshotMonthlyCost -SizeGiB 1024 -Tier '' -PriceTable $null -DefaultPrice 0.05) 51.2
+Assert-Equal 'zero size costs nothing'    (Get-SnapshotMonthlyCost -SizeGiB 0 -Tier '' -PriceTable $null -DefaultPrice 0.05) 0
 
-$empty = Import-KnownCommvaultId -Path ''
-Assert-Equal 'no file still returns a real set, not $null' ($null -ne $empty) 'True'
-Assert-Equal 'and it is a HashSet'                         ($empty.GetType().Name) 'HashSet`1'
-Assert-Equal 'and it is empty'                             ($empty.Count) 0
+# A flat rate across tiers is the quickest way to a confidently wrong number: AWS archive is about a
+# quarter of standard, so the table has to win over the default.
+$tiers = @{ 'standard' = 0.05; 'archive' = 0.0125; 'Standard_ZRS' = 0.0625 }
+Assert-Equal 'standard tier uses its own rate' (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'standard' -PriceTable $tiers -DefaultPrice 0.99) 5
+Assert-Equal 'archive tier is cheaper'         (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'archive' -PriceTable $tiers -DefaultPrice 0.99) 1.25
+Assert-Equal 'Azure ZRS is dearer'             (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'Standard_ZRS' -PriceTable $tiers -DefaultPrice 0.99) 6.25
+Assert-Equal 'an unlisted tier falls back'     (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'premium_v2' -PriceTable $tiers -DefaultPrice 0.10) 10
+Assert-Equal 'a blank tier falls back'         (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier '' -PriceTable $tiers -DefaultPrice 0.10) 10
 
-@('snap-one', 'snap-two') | Set-Content -Path $tmp
-$loaded = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'a populated file stays a HashSet' ($loaded.GetType().Name) 'HashSet`1'
-Assert-Equal 'with both entries'                ($loaded.Count) 2
-Assert-Equal 'and keeps its case-insensitive comparer' ($loaded.Contains('SNAP-ONE')) 'True'
+# Every figure anywhere carries its currency and groups thousands, so no number can be misread as a
+# bare count or as the wrong currency.
+Assert-Equal 'thousands are grouped'     (Format-Money 11136 'USD') 'USD 11,136'
+Assert-Equal 'millions are grouped too'  (Format-Money 2500000 'USD') 'USD 2,500,000'
+Assert-Equal 'currency is never hardcoded' (Format-Money 1000 'GBP') 'GBP 1,000'
+Assert-Equal 'currency travels with zero'  (Format-Money 0 'USD') 'USD 0'
+Assert-Equal 'large amounts drop decimals' (Format-Money 928.44 'USD') 'USD 928'
 
-# A single-entry file is the case that most easily collapses to a bare string.
-'only-one' | Set-Content -Path $tmp
-$one = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'a one-line file does not collapse to a string' ($one.GetType().Name) 'HashSet`1'
-Assert-Equal 'and still matches'                             ($one.Contains('ONLY-ONE')) 'True'
+# A 2 GiB snapshot costs pennies a month. Rounding that to "USD 0" reads as free when it is not.
+Assert-Equal 'pennies keep their decimals' (Format-Money 0.11 'USD') 'USD 0.11'
+Assert-Equal 'small monthly costs survive' (Format-Money 6.35 'USD') 'USD 6.35'
+Assert-Equal 'the boundary rounds up'      (Format-Money 99.99 'USD') 'USD 99.99'
+Assert-Equal 'and 100 goes whole'          (Format-Money 100 'USD') 'USD 100'
 
-# Comments and blanks are ignored.
-@('# exported from Commvault', '', 'real-snap', '   ') | Set-Content -Path $tmp
-$filtered = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'comments and blank lines are skipped' ($filtered.Count) 1
+# Grid cells are tight, so only there do huge figures compact - and they still carry the currency.
+Assert-Equal 'cells carry the currency'    (Format-MoneyCell 18010 'USD') 'USD 18,010'
+Assert-Equal 'cells compact at millions'   (Format-MoneyCell 2500000 'USD') 'USD 2.5M'
+Assert-Equal 'cells keep pennies visible'  (Format-MoneyCell 1.32 'USD') 'USD 1.32'
 
-# CSV form, as exported from most tools.
-@('SnapshotName,JobId', 'csv-snap-1,900', 'csv-snap-2,901') | Set-Content -Path $tmp
-$csv = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'CSV export is understood'  ($csv.Count) 2
-Assert-Equal 'CSV picks the right column' ($csv.Contains('csv-snap-1')) 'True'
+#============================================================
+Write-Section 'Cost summary rolls up every way the CSV needs'
+#============================================================
+# 3 orphans at 100 GiB and 2 source-active at 50 GiB, all at 0.05/GiB/month.
+#   Orphaned      3 x 100 x 0.05 = 15.00/mo -> 180.00/yr
+#   SourceActive  2 x  50 x 0.05 =  5.00/mo ->  60.00/yr
+#   Total                          20.00/mo -> 240.00/yr, so Orphaned is 75% of spend
+$costSample = @(
+  1..3 | ForEach-Object { [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
+      SizeGiB = 100.0; EstMonthlyCost = 5.0 } }
+  1..2 | ForEach-Object { [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
+      SizeGiB = 50.0; EstMonthlyCost = 2.5 } }
+)
+$cost = Get-CostSummary -Rows $costSample -Currency 'USD'
 
-Remove-Item $tmp -ErrorAction SilentlyContinue
+$orph = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'Orphaned' })[0]
+Assert-Equal 'orphaned monthly'  $orph.EstMonthlyCost 15
+Assert-Equal 'orphaned annual'   $orph.EstAnnualCost 180
+Assert-Equal 'orphaned capacity' $orph.CapacityGiB 300
+Assert-Equal 'orphaned count'    $orph.Snapshots 3
+Assert-Equal 'orphaned share'    $orph.ShareOfSpendPct 75
 
-# The other set-returning functions call cloud cmdlets, so assert at the source level instead.
+$act = @($cost | Where-Object { $_.Grouping -eq 'SourceActive' })
+$sa = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'SourceActive' })[0]
+Assert-Equal 'source-active annual' $sa.EstAnnualCost 60
+Assert-Equal 'source-active share'  $sa.ShareOfSpendPct 25
+
+$tot = @($cost | Where-Object { $_.Grouping -eq 'Total' })[0]
+Assert-Equal 'total monthly'      $tot.EstMonthlyCost 20
+Assert-Equal 'total annual'       $tot.EstAnnualCost 240
+Assert-Equal 'total is 100%'      $tot.ShareOfSpendPct 100
+Assert-Equal 'annual is 12x monthly' ($tot.EstAnnualCost -eq $tot.EstMonthlyCost * 12) 'True'
+# Category shares must account for everything, or the table misleads.
+Assert-Equal 'category shares sum to 100' ((@($cost | Where-Object { $_.Grouping -eq 'Category' }) | Measure-Object ShareOfSpendPct -Sum).Sum) 100
+
+$del = @($cost | Where-Object { $_.Grouping -eq 'Action' -and $_.Action -eq 'Delete' })[0]
+Assert-Equal 'the Delete roll-up is the real saving' $del.EstAnnualCost 180
+$byAge = @($cost | Where-Object { $_.Grouping -eq 'Category x Age' -and $_.Category -eq 'Orphaned' })[0]
+Assert-Equal 'age breakdown is present'  $byAge.AgeBand 'Over 365 days'
+Assert-Equal 'age breakdown carries cost' $byAge.EstAnnualCost 180
+Assert-Equal 'every row names its currency' (@($cost | Where-Object { $_.Currency -ne 'USD' }).Count) 0
+# An empty category must not appear as a zero row and dilute the table.
+Assert-Equal 'empty categories are omitted' (@($cost | Where-Object { $_.Grouping -eq 'Category' }).Count) 2
+
+#============================================================
+Write-Section 'Ownership: the split the report is built on'
+#============================================================
+# The report answers "what can I remove that Commvault does not own", so ownership is the top-level
+# partition and everything analytic is computed on the non-Commvault side.
+Assert-Equal 'Commvault is its own population'   (Get-SnapshotOwnership -Creator 'Commvault') 'Commvault'
+Assert-Equal 'cloud-native is not Commvault'     (Get-SnapshotOwnership -Creator 'CloudNative') 'Not Commvault'
+# Azure Backup and Site Recovery are Protected but they are NOT Commvault's, so a customer still sees
+# them in the main analysis rather than having them folded into the Commvault panel.
+Assert-Equal 'Azure Backup is not Commvault'     (Get-SnapshotOwnership -Creator 'AzureBackup') 'Not Commvault'
+Assert-Equal 'Site Recovery is not Commvault'    (Get-SnapshotOwnership -Creator 'SiteRecovery') 'Not Commvault'
+Assert-Equal 'AWS Backup is not Commvault'       (Get-SnapshotOwnership -Creator 'AwsBackup') 'Not Commvault'
+Assert-Equal 'DLM is not Commvault'              (Get-SnapshotOwnership -Creator 'DlmManaged') 'Not Commvault'
+
+# Cost roll-ups must keep the two populations apart, or the savings figure quietly includes Commvault.
+$mixed = @(
+  [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
+    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
+  [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
+    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
+  [pscustomobject]@{ Category = 'Protected'; AgeBand = '0-30 days'; Action = 'Keep'
+    Ownership = 'Commvault'; SizeGiB = 200.0; EstMonthlyCost = 10.0 }
+)
+$mc = Get-CostSummary -Rows $mixed -Currency 'USD'
+$notCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Not Commvault' })[0]
+$isCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Commvault' })[0]
+Assert-Equal 'non-Commvault annual is reported'  $notCv.EstAnnualCost 120
+Assert-Equal 'Commvault annual is reported too'  $isCv.EstAnnualCost 120
+Assert-Equal 'non-Commvault covers 2 snapshots'  $notCv.Snapshots 2
+Assert-Equal 'Commvault covers 1'                $isCv.Snapshots 1
+
+# Age-band rows drive "cost per range" in the report, and must exclude Commvault.
+$band = @($mc | Where-Object { $_.Grouping -eq 'Age band (not Commvault)' -and $_.AgeBand -eq '0-30 days' })[0]
+Assert-Equal 'the age band skips the Commvault row' $band.Snapshots 1
+Assert-Equal 'and costs only the non-Commvault one' $band.EstAnnualCost 60
+
+# The per-snapshot CSVs name their currency in a column rather than leaving a bare number.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  Assert-Equal "$(Split-Path $script -Leaf) writes a Currency column" ($body -match 'Currency\s+= \$Currency') 'True'
+}
+
+# The two scripts differ here on purpose: Azure's marker is definitive, AWS's is not.
+$azBody = Get-Content -Path $azureScript -Raw
+$awsBody2 = Get-Content -Path $awsScript -Raw
+Assert-Equal 'Azure splits the two populations'      ($azBody -match 'SplitByOwnership = \$true') 'True'
+Assert-Equal 'AWS splits them too, now the marker is confirmed' ($awsBody2 -match 'SplitByOwnership = \$true') 'True'
+
+# A parameter can be silently dropped by an edit to the param block while the code that uses it
+# stays behind, which fails only at runtime and only on the path that touches it. Both scripts
+# advertise the same switches, so check each is actually declared in both.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  $name = Split-Path $script -Leaf
+  foreach ($param in @('AuditCreatorEvidence', 'AcknowledgeNoCommvaultSnapshots', 'IncludeCommvaultSnapshots',
+                       'IncludeBackupServiceSnapshots', 'KeepTagKey', 'DeleteScope', 'PriceTable',
+                       'MinAgeDays', 'SourceActiveMinAgeDays', 'MaxDeletions', 'DeleteFromReport',
+                       'PricePerGiBMonth', 'Currency', 'OutputPath', 'AutoInstallModules', 'Force')) {
+    Assert-Equal "$name declares -$param" ($body -match "(?m)^\s*(\[\w+(\[\])?\]\s*)?\`$$param\s*[,)=]") 'True'
+  }
+}
+
+# Anything the summary reads must exist on the rows both scripts build.
+foreach ($script in @($azureScript, $awsScript)) {
+  $body = Get-Content -Path $script -Raw
+  $name = Split-Path $script -Leaf
+  foreach ($prop in @('Ownership', 'Category', 'Action', 'AgeBand', 'SizeGiB', 'EstMonthlyCost', 'EstAnnualCost', 'Currency')) {
+    Assert-Equal "$name populates $prop" ($body -match "(?m)^\s*$prop\s+=") 'True'
+  }
+}
+
+#============================================================
+Write-Section 'Regressions: PowerShell collection-unrolling traps'
+#============================================================
+# Both bugs below shipped and were only caught by running the scripts end to end. They share a root
+# cause: PowerShell unrolls collections through the pipeline, so a collection can arrive somewhere as
+# something other than a collection.
+
+# 1. A single-element array assigned from an if-statement is unrolled back to a bare scalar, and
+#    foreach over $null runs zero times. In the AWS script that meant the default credential path
+#    (no -ProfileName) silently scanned nothing at all and reported a clean, empty estate.
+$noProfiles = $null
+$unrolled = if ($noProfiles -and $noProfiles.Count -gt 0) { $noProfiles } else { @($null) }
+$iterations = 0; foreach ($x in $unrolled) { $iterations++ }
+Assert-Equal 'the unsafe form really does iterate zero times' $iterations 0
+$wrapped = @(if ($noProfiles -and $noProfiles.Count -gt 0) { $noProfiles } else { '' })
+$iterations2 = 0; foreach ($x in $wrapped) { $iterations2++ }
+Assert-Equal 'the @() wrapper restores the single pass' $iterations2 1
+
+$awsBody = Get-Content -Path $awsScript -Raw
+Assert-Equal 'AWS builds its profile list with an @() wrapper' ($awsBody -match '\$profiles = @\(if ') 'True'
+Assert-Equal 'AWS no longer uses the unrolling form'          ($awsBody -notmatch '\$profiles = if ') 'True'
+
+# 2. A bare "return $set" hands back $null for an empty set and a plain array otherwise, losing the
+#    type and the case-insensitive comparer. Every .Contains() downstream then throws or silently
+#    turns case-sensitive. These functions call cloud cmdlets, so assert at the source level.
 foreach ($pair in @(@{ File = $azureScript; Fn = 'Get-ImageReferencedSnapshotIds' },
-                    @{ File = $azureScript; Fn = 'Get-LockedResourceIds' },
-                    @{ File = $azureScript; Fn = 'Import-KnownCommvaultId' },
-                    @{ File = $awsScript; Fn = 'Get-ImageReferencedSnapshotIds' },
-                    @{ File = $awsScript; Fn = 'Import-KnownCommvaultId' })) {
+                    @{ File = $azureScript; Fn = 'Get-LockedResourceIds' })) {
   $text = Get-FunctionText -Path $pair.File -Name @($pair.Fn)
-  # Catches a bare return anywhere in the function, including an early one inside a guard clause.
+  if (-not $text) { continue }
   $bare = $text -match 'return\s+\$(ids|set)\s*[}\r\n]'
   Assert-Equal "$(Split-Path $pair.File -Leaf)/$($pair.Fn) does not bare-return its set" (-not $bare) 'True'
 }
+
+# The AWS image index returns a pscustomobject holding a hashtable and a set. Neither is unrolled,
+# which is the point of wrapping them in an object rather than returning two collections.
+$idxText = Get-FunctionText -Path $awsScript -Name @('Get-ImageIndex')
+Assert-Equal 'the AWS image index returns a single object' ($idxText -match 'return \[pscustomobject\]') 'True'
 
 #============================================================
 Write-Section 'End to end: a realistic estate lands where it should'
 #============================================================
 # The case that started all this - a snapshot whose disk is alive and two years old is NOT an orphan,
 # and must not be deleted under the default scope however old it is.
-$oldButLive = Get-SnapshotCategory -SourceExists $true -HasSourceReference $true -ReferencedByImage $false `
+$oldButLive = Get-SnapshotCategory -SourceExists $true -SourceAttached $true -HasSourceReference $true -ReferencedByImage $false `
   -HasKeepTag $false -IsPinned $false -PinnedReason '' -Creator 'CloudNative' -CreatorExcluded $false
 Assert-Equal 'two-year-old live snapshot is SourceActive' $oldButLive.Category 'SourceActive'
 Assert-Equal '...and is only reviewed by default' ((Get-SnapshotAction -Category $oldButLive.Category -AgeDays 730 -DeleteScope @('Orphaned') @bars).Action) 'Review'
 Assert-Equal '...and deletes only once scoped in'  ((Get-SnapshotAction -Category $oldButLive.Category -AgeDays 730 -DeleteScope @('Orphaned', 'SourceActive') @bars).Action) 'Delete'
 
 # Every category must be one the report knows how to render.
-foreach ($c in @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')) {
+foreach ($c in @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')) {
   Assert-Equal "category '$c' is renderable" ($CategoryOrder -contains $c) 'True'
 }
 
