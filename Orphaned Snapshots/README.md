@@ -29,9 +29,7 @@ Those are not a saving — deleting them breaks recovery points. So the report d
 Everything below the Commvault panel is the non-Commvault population. The headline number is what
 that population costs per year.
 
-> **AWS is reported as one population for now.** Commvault's AWS marker is observed rather than
-> confirmed, so the AWS report does not split, and says so in a banner: its totals may include
-> Commvault snapshots. Azure's marker is definitive, so Azure splits cleanly.
+Both clouds split cleanly — Commvault's marker is confirmed on each.
 
 ## "Orphaned" is the small half of the problem
 
@@ -145,32 +143,29 @@ queried from Commvault, and there is no list to export.
 Defaults: `-CommvaultNamePattern 'COMMVAULT','GXMD_SNAP'` and `-CommvaultTagKey 'Commvault'` (matched
 against tag keys and values). Both stay parameterised if an unusual deployment needs widening.
 
-### AWS — the marker is the Name tag, not the description
+### AWS — confirmed, via tags
 
-Commvault names its AWS EBS snapshots through the **`Name` tag**:
+Commvault tags every AWS EBS snapshot it creates:
 
-```
-Snapshot ID   snap-0eb82e4a325e7839b
-Name tag      SP_2_8465372_40229960_1789636362
-Description   Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156
-```
+| Tag | Value |
+|---|---|
+| `commvault:vendor` | `Commvault` |
+| `commvault:createdBy` | `Commvault Cloud (M036)` |
+| `Description` | `Snapshot_created_by_Commvault_for_job_8465372_at_1789636362._Source_Volume_vol-...` |
+| `_GX_BACKUP_` | *(no value)* |
+| `Name` | `SP_2_8465372_40229960_1789636362` |
 
-The form is `SP_<n>_<jobid>_<n>_<epoch>` — the third field is the Commvault job id (the same series as
-Azure's) and the last is a unix timestamp matching the start time.
+The default `-CommvaultTagKey 'commvault'` matches the two `commvault:*` keys, their values, **and**
+the `Description` tag's wording — three independent catches from one pattern, so no single tag being
+renamed or dropped loses the snapshot. `_GX_BACKUP_` is a fourth, and the `Name` form
+`SP_<n>_<jobid>_<n>_<epoch>` a fifth.
 
-**The description is not a marker.** Commvault drives AWS `CreateImage`, so AWS writes its own
-boilerplate and Commvault's wording never appears. This is the opposite of Azure, where the marker is
-in the name and tags.
+**Mind the two different "descriptions".** Commvault's own wording lives in a **`Description` tag**.
+The **native EC2 description field** is AWS boilerplate — `Created by CreateImage(i-...) for ami-...` —
+because Commvault drives `CreateImage`. Only the tag is a marker.
 
-Because Commvault goes through `CreateImage`, a snapshot can also carry no marker of its own. So the
-script **inherits the creator from the AMI the snapshot backs** — if the image above it is Commvault's,
-the snapshot is too. That catches what snapshot-level matching misses.
-
-Defaults: `-CommvaultNamePattern '^SP_\d+_\d+_\d+_\d+','commvault','_GX_BACKUP_','_GX_AMI_'`.
-
-These come from observed snapshots rather than documentation, so confirm against your own account with
-`-AuditCreatorEvidence` before relying on them to delete. If Commvault also writes tags of its own,
-the `TagPair` rows will show them — check the **Tags** tab on a known Commvault snapshot.
+Because Commvault goes via `CreateImage`, a snapshot may also carry no marker of its own, so the
+script additionally **inherits ownership from the AMI the snapshot backs**.
 
 ### The zero-detection guard (both clouds)
 
@@ -305,7 +300,7 @@ Shared by both scripts:
 | `-DeleteScope` | `Orphaned` | Which categories `-Delete` may act on. `Protected`/`InUse` not accepted. |
 | `-AuditCreatorEvidence` | off | Write a CSV of tag pairs, tag keys, name prefixes and masked description templates — how you find a marker you don't know yet. |
 | `-AcknowledgeNoCommvaultSnapshots` | off | Permit `-Delete` when zero Commvault snapshots were detected. Otherwise that aborts. |
-| `-CommvaultNamePattern` / `-CommvaultTagKey` | Azure: `COMMVAULT`, `GXMD_SNAP` / `Commvault`. AWS: provisional. | Commvault markers. Definitive on Azure; still being confirmed on AWS. |
+| `-CommvaultNamePattern` / `-CommvaultTagKey` | Azure: `COMMVAULT`, `GXMD_SNAP` / `Commvault`. AWS: `^SP_\d+_\d+_\d+_\d+` etc / `commvault`, `_GX_BACKUP_`. | Commvault markers. Confirmed against real snapshots on both clouds. |
 | `-IncludeCommvaultSnapshots` | off | Move Commvault snapshots out of `Protected`. Not recommended. |
 | `-IncludeBackupServiceSnapshots` | off | Move cloud backup-service snapshots out of `Protected`. Strongly discouraged. |
 | `-KeepTagKey` | `DoNotDelete`, `KeepSnapshot`, `Preserve` | Tag keys that force `Protected`. |
@@ -339,8 +334,8 @@ cap, keep the scope narrow, and keep the logs.
 ```
 
 Report for several weeks before letting anything delete on a schedule, and do not widen
-`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. **Confirm the AWS marker against your own
-account before scheduling the AWS script with `-Delete`** — nobody is watching the output.
+`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. Confirm the creator counts against what Commvault reports it is protecting before scheduling either
+script with `-Delete` — nobody is watching the output.
 
 ---
 
@@ -350,10 +345,11 @@ account before scheduling the AWS script with `-Delete`** — nobody is watching
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-159 assertions over the category rules, the ownership split,, precedence, age bars, delete scoping, cost arithmetic and
+164 assertions over the category rules, the ownership split,, precedence, age bars, delete scoping, cost arithmetic and
 per-tier pricing, the cost roll-ups, the zero-detection guard,
-both clouds' Commvault markers (asserted against the real snapshot name, tags and description taken
-from the Azure portal and the AWS console), AMI creator inheritance, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
+both clouds' Commvault markers (asserted against the real snapshot names, tags and descriptions taken
+from the Azure portal and the AWS console, with each AWS tag checked to stand alone), AMI creator
+inheritance, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
 and regression guards on two PowerShell collection-unrolling traps that shipped and were only caught
 by running the scripts end to end. It parses the two scripts to lift
 their functions out, so it never touches a cloud and needs no credentials. **Run it after changing any

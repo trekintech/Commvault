@@ -203,18 +203,33 @@ Assert-Equal 'null tag list is empty'           ((ConvertTo-TagHashtable -Tags $
 # AWS keeps its own, still-unverified pattern set - deliberately NOT Azure's confirmed markers,
 # because no AWS equivalent of the COMMVAULT name stamp has been identified yet.
 $awsCvName = @('^SP_\d+_\d+_\d+_\d+', 'commvault', '_GX_BACKUP_', '_GX_AMI_')
-$awsCvTag = @('Commvault', 'CV_JobId', '_GX_BACKUP_', '_GX_AMI_')
+$awsCvTag = @('commvault', '_GX_BACKUP_')
 function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Image = $null)
   Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -ImageInfo $Image `
     -CommvaultNamePattern $awsCvName -CommvaultTagKey $awsCvTag
 }
-# The real thing, taken verbatim from an AWS console snapshot page.
+# The real thing, taken verbatim from an AWS console snapshot page - every tag it actually carries.
 $realAwsDesc = 'Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156'
-$realAwsTags = ConvertTo-TagHashtable @((Tag 'Name' 'SP_2_8465372_40229960_1789636362'))
-Assert-Equal 'a real Commvault EBS snapshot'   (AwsCreator $realAwsDesc $realAwsTags) 'Commvault'
-# The description is AWS boilerplate from CreateImage - on its own it proves nothing.
-Assert-Equal 'its description alone is not a marker' (AwsCreator $realAwsDesc @{}) 'CloudNative'
-Assert-Equal 'the SP_ Name tag alone is enough'      (AwsCreator 'anything' $realAwsTags) 'Commvault'
+$realAwsTags = ConvertTo-TagHashtable @(
+  (Tag 'commvault:vendor' 'Commvault')
+  (Tag 'commvault:createdBy' 'Commvault Cloud (M036)')
+  (Tag 'Description' 'Snapshot_created_by_Commvault_for_job_8465372_at_1789636362._Source_Volume_vol-089fa2758cd9cb01e_from_lsp01036c1us01')
+  (Tag '_GX_BACKUP_' '')
+  (Tag 'Name' 'SP_2_8465372_40229960_1789636362')
+)
+Assert-Equal 'a real Commvault EBS snapshot' (AwsCreator $realAwsDesc $realAwsTags) 'Commvault'
+
+# Each marker has to stand alone, so losing or renaming any one tag does not lose the snapshot.
+Assert-Equal 'commvault:vendor alone'    (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'commvault:vendor' 'Commvault')))) 'Commvault'
+Assert-Equal 'commvault:createdBy alone' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'commvault:createdBy' 'Commvault Cloud (M036)')))) 'Commvault'
+Assert-Equal 'the Description tag alone' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Description' 'Snapshot_created_by_Commvault_for_job_1_at_2._Source_Volume_vol-3')))) 'Commvault'
+Assert-Equal '_GX_BACKUP_ with no value' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag '_GX_BACKUP_' '')))) 'Commvault'
+Assert-Equal 'the SP_ Name tag alone'    (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_2_8465372_40229960_1789636362')))) 'Commvault'
+
+# The NATIVE description field is AWS boilerplate from CreateImage. Commvault's own wording lives in
+# a Description TAG, which is a different thing - the native field proves nothing on its own.
+Assert-Equal 'the native description is not a marker' (AwsCreator $realAwsDesc @{}) 'CloudNative'
+Assert-Equal 'an untagged snapshot stays cloud-native' (AwsCreator 'manual snap' @{}) 'CloudNative'
 # A bare SP_ prefix is too loose to be the marker; the full structure is what identifies it.
 Assert-Equal 'SP_ without the full structure is not matched' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_backup')))) 'CloudNative'
 Assert-Equal 'SP_ with the full structure matches'          (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_9_1234567_7654321_1700000000')))) 'Commvault'
@@ -424,7 +439,7 @@ Assert-Equal 'cells compact only at millions' (Format-MoneyCell 2500000) '2.5M'
 $azBody = Get-Content -Path $azureScript -Raw
 $awsBody2 = Get-Content -Path $awsScript -Raw
 Assert-Equal 'Azure splits the two populations'      ($azBody -match 'SplitByOwnership = \$true') 'True'
-Assert-Equal 'AWS reports the estate as one for now' ($awsBody2 -match 'SplitByOwnership = \$false') 'True'
+Assert-Equal 'AWS splits them too, now the marker is confirmed' ($awsBody2 -match 'SplitByOwnership = \$true') 'True'
 
 #============================================================
 Write-Section 'Regressions: PowerShell collection-unrolling traps'

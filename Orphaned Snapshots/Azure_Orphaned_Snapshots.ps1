@@ -1408,7 +1408,8 @@ if (-not $DeleteFromReport) {
 }
 
 $cvAll = @($results | Where-Object { $_.Ownership -eq 'Commvault' })
-$focusAll = if ($true) { @($results | Where-Object { $_.Ownership -ne 'Commvault' }) } else { @($results) }
+# Both clouds have a confirmed Commvault marker, so both report against the non-Commvault side.
+$focusAll = @($results | Where-Object { $_.Ownership -ne 'Commvault' })
 $focusMonthly = [math]::Round([double](($focusAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 $cvMonthlyTotal = [math]::Round([double](($cvAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 

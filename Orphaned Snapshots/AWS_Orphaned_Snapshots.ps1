@@ -35,15 +35,24 @@ Category is a fact about the snapshot. ACTION is what this run would do about it
 So the report reads the same whatever flags you pass; only the Action column moves.
 
 WHAT IS EXCLUDED FROM DELETION
-Commvault-created snapshots (matched on Name tag / description regex and tag), plus AWS Backup
-(tag aws:backup:*) and DLM lifecycle-managed snapshots (tag aws:dlm:*). DLM and AWS Backup expire
-their own snapshots on a schedule; deleting one out from under its policy breaks the recovery point
-and the policy just makes another. They are classified, counted and reported, never deleted.
+Commvault-created snapshots, plus AWS Backup (tag aws:backup:*) and DLM lifecycle-managed snapshots
+(tag aws:dlm:*). DLM and AWS Backup expire their own snapshots on a schedule; deleting one out from
+under its policy breaks the recovery point and the policy just makes another.
 
-IMPORTANT - verify the Commvault detection patterns against your own environment before deleting
-anything. Commvault snapshot naming varies by agent, version and IntelliSnap configuration. Run in
-report mode first, check the "By creator" table, and confirm every snapshot you expect Commvault to
-own is classified as "Commvault". Adjust -CommvaultNamePattern / -CommvaultTagKey until it is.
+Commvault detection is tag-based and confirmed against real snapshots. Commvault writes:
+
+  commvault:vendor      Commvault
+  commvault:createdBy   Commvault Cloud (M036)
+  Description           Snapshot_created_by_Commvault_for_job_<jobid>_at_<epoch>._Source_Volume_...
+  _GX_BACKUP_           (no value)
+  Name                  SP_<n>_<jobid>_<n>_<epoch>
+
+Note that Commvault's own wording is in a Description TAG. The native EC2 description field is AWS
+boilerplate from CreateImage, because Commvault drives CreateImage, and is not a marker by itself.
+A snapshot also inherits Commvault ownership from the AMI it backs.
+
+Because ownership can be established reliably, the report separates Commvault-created snapshots from
+everything else and reports the saving against the non-Commvault population alone.
 
 SAFETY MODEL
 - Report-only by default. Nothing is deleted without -Delete.
@@ -104,18 +113,13 @@ param (
 
   [switch]$IncludeRdsSnapshots,
 
-  # Regex patterns identifying Commvault-created snapshots. Matched against the Name tag, the
-  # description, and the name/tags of the AMI the snapshot backs. Case-insensitive.
+  # Name/description markers for Commvault-created snapshots (case-insensitive regex), matched
+  # against the Name tag, the native EC2 description, and the name/tags of the AMI the snapshot
+  # backs. Secondary to the tag markers below - Commvault always tags, but does not always name.
   #
-  # Commvault names its AWS EBS snapshots through the Name tag, in the form
-  #   SP_<n>_<jobid>_<n>_<epoch>      e.g.  SP_2_8465372_40229960_1789636362
-  # where the third field is the Commvault job id and the last is a unix timestamp. Note that the
-  # snapshot DESCRIPTION is no help here: Commvault drives AWS CreateImage, so AWS writes its own
-  # boilerplate ("Created by CreateImage(i-...) for ami-...") and Commvault's own wording never
-  # appears. This is the opposite of Azure, where the marker is in the name and tags.
-  #
-  # Derived from observed snapshots rather than documentation, so confirm it against your own
-  # account with -AuditCreatorEvidence before relying on it for deletion.
+  # Commvault names its AWS EBS snapshots SP_<n>_<jobid>_<n>_<epoch>, e.g.
+  #   SP_2_8465372_40229960_1789636362
+  # where the third field is the Commvault job id and the last is a unix timestamp.
   [string[]]$CommvaultNamePattern = @(
     '^SP_\d+_\d+_\d+_\d+',
     'commvault',
@@ -123,12 +127,24 @@ param (
     '_GX_AMI_'
   ),
 
-  # Tag markers, matched against both tag keys and tag values. Case-insensitive.
+  # Tag markers, matched against both tag keys and tag values (case-insensitive). These are the
+  # reliable ones. A real Commvault EBS snapshot carries:
+  #
+  #   commvault:vendor      Commvault
+  #   commvault:createdBy   Commvault Cloud (M036)
+  #   Description           Snapshot_created_by_Commvault_for_job_8465372_at_1789636362._Source_...
+  #   _GX_BACKUP_           (no value)
+  #   Name                  SP_2_8465372_40229960_1789636362
+  #
+  # 'commvault' alone catches the first three - the two commvault:* keys and their values, and the
+  # Description tag's wording - so no single tag being dropped or renamed loses the snapshot.
+  #
+  # Note the distinction: Commvault's own wording lives in a Description TAG. The native EC2
+  # description field is AWS boilerplate from CreateImage ("Created by CreateImage(i-...) for
+  # ami-...") because Commvault drives CreateImage, and is not a marker on its own.
   [string[]]$CommvaultTagKey = @(
-    'Commvault',
-    'CV_JobId',
-    '_GX_BACKUP_',
-    '_GX_AMI_'
+    'commvault',
+    '_GX_BACKUP_'
   ),
 
   # Treat Commvault snapshots as deletion candidates too. Off by default, and deliberately so.
@@ -1544,10 +1560,8 @@ if (-not $DeleteFromReport) {
   if (-not $CheckSharing) { $caveat += ' Sharing was not checked - re-run with -CheckSharing to exclude snapshots shared with other accounts.' }
   New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
     Title      = 'AWS Snapshot Report'
-    # The AWS marker is observed rather than confirmed, so the estate is reported as one population.
-    # Splitting on a marker we cannot vouch for would imply a separation the data does not support.
-    # Flip to $true once -AuditCreatorEvidence confirms the marker against a real account.
-    SplitByOwnership = $false
+    # Confirmed against a real Commvault snapshot's tags, so the two populations separate cleanly.
+    SplitByOwnership = $true
     CostCaveat = $caveat
     Columns    = @(
       @{ Label = 'Account'; Prop = 'AccountId' }
@@ -1575,14 +1589,20 @@ if (-not $DeleteFromReport) {
 }
 
 $cvAll = @($results | Where-Object { $_.Ownership -eq 'Commvault' })
-$focusAll = if ($false) { @($results | Where-Object { $_.Ownership -ne 'Commvault' }) } else { @($results) }
+# Both clouds have a confirmed Commvault marker, so both report against the non-Commvault side.
+$focusAll = @($results | Where-Object { $_.Ownership -ne 'Commvault' })
 $focusMonthly = [math]::Round([double](($focusAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 $cvMonthlyTotal = [math]::Round([double](($cvAll | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 
 Write-Host ""
 Write-Host "  Snapshots scanned   : $($results.Count)" -ForegroundColor White
-Write-Host "  (Commvault snapshots are not separated - marker unconfirmed for this cloud)" -ForegroundColor Yellow
+if ($cvAll.Count -gt 0) {
+  Write-Host ("  Commvault-created   : {0} ({1} GiB, {2} {3}/yr) - excluded from the figures below" -f `
+      $cvAll.Count, [math]::Round([double](($cvAll | Measure-Object SizeGiB -Sum).Sum), 2), $Currency,
+      (($cvMonthlyTotal * 12).ToString('N0'))) -ForegroundColor Green
+}
 Write-Host ""
+Write-Host "  Not Commvault-created:" -ForegroundColor White
 foreach ($cat in $script:CategoryOrder) {
   $g = @($focusAll | Where-Object { $_.Category -eq $cat })
   if ($g.Count -eq 0) { continue }
