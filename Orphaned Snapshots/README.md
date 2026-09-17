@@ -46,6 +46,16 @@ other figure — shown so it is clear they were found, not missed.
 
 **4. Cost by age**, so "snapshots older than a year are costing us X" is one glance.
 
+**5. Cost by region** — and by subscription and resource group on Azure, by account on AWS — so you can
+see where the spend sits. Each is shown both for the whole estate and excluding Commvault. A breakdown
+with only one value (a single-region estate) is skipped rather than repeating the total.
+
+### Filtering by region
+
+The per-snapshot CSVs carry `Location` + `SubscriptionName` + `ResourceGroupName` on Azure and `Region`
++ `AccountId` + `ProfileUsed` on AWS, so they pivot by region directly. The cost summary carries
+matching `Grouping` / `Scope` rows if you want the totals without pivoting.
+
 ---
 
 ## Running it
@@ -134,7 +144,7 @@ Deletion is permanent. Snapshots cannot be recovered once removed.
 | `*_Snapshot_Report_<ts>.html` | The report. Share this. |
 | `*_Snapshots_All_<ts>.csv` | Every snapshot, with category, age, cost and reasoning. |
 | `*_Snapshots_Candidates_<ts>.csv` | The deletion list — review this, then feed it back. |
-| `*_Cost_Summary_<ts>.csv` | Cost by owner, category, age band and action. For finance. |
+| `*_Cost_Summary_<ts>.csv` | Cost by owner, category, age band, action **and region**. For finance. |
 | `*_Snapshots_Deleted_<ts>.csv` | What was removed, and what it was costing. Only with `-Delete`. |
 | `*_Creator_Evidence_<ts>.csv` | Tags and naming found in the estate. Only with `-AuditCreatorEvidence`. |
 
