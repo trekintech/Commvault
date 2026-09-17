@@ -1210,6 +1210,9 @@ $(if ($splitOwnership) {
 $(($script:CategoryOrder | ForEach-Object {
   $cat = $_
   $g = @($focus | Where-Object { $_.Category -eq $cat })
+  # Skip categories with nothing in them, so the tiles agree with the cost table rather than
+  # showing a row of zeroes the table omits.
+  if ($g.Count -eq 0) { return }
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
   $m = [double](($g | Measure-Object EstMonthlyCost -Sum).Sum)
   "<div class='tile'><div class='label'><span class='dot' style='background:$($catMeta[$cat].Colour)'></span>$cat</div><div class='value'>$($g.Count)</div><div class='sub'>$(Format-Gib $gib)</div><div class='cost'>$(Format-Money ($m * 12) $Totals.Currency)/yr</div></div>"
