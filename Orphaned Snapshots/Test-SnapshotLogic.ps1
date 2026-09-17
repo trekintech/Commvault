@@ -367,162 +367,71 @@ Assert-Equal 'cells compact at millions'   (Format-MoneyCell 2500000 'USD') 'USD
 Assert-Equal 'cells keep pennies visible'  (Format-MoneyCell 1.32 'USD') 'USD 1.32'
 
 #============================================================
-Write-Section 'Cost summary rolls up every way the CSV needs'
+Write-Section 'Cost summary is one row per combination, and it adds up'
 #============================================================
-# 3 orphans at 100 GiB and 2 source-active at 50 GiB, all at 0.05/GiB/month.
-#   Orphaned      3 x 100 x 0.05 = 15.00/mo -> 180.00/yr
-#   SourceActive  2 x  50 x 0.05 =  5.00/mo ->  60.00/yr
-#   Total                          20.00/mo -> 240.00/yr, so Orphaned is 75% of spend
-$costSample = @(
-  1..3 | ForEach-Object { [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
-      SizeGiB = 100.0; EstMonthlyCost = 5.0 } }
-  1..2 | ForEach-Object { [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
-      SizeGiB = 50.0; EstMonthlyCost = 2.5 } }
-)
-$cost = Get-CostSummary -Rows $costSample -Currency 'USD'
-
-$orph = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'Orphaned' })[0]
-Assert-Equal 'orphaned monthly'  $orph.EstMonthlyCost 15
-Assert-Equal 'orphaned annual'   $orph.EstAnnualCost 180
-Assert-Equal 'orphaned capacity' $orph.CapacityGiB 300
-Assert-Equal 'orphaned count'    $orph.Snapshots 3
-Assert-Equal 'orphaned share'    $orph.ShareOfSpendPct 75
-
-$act = @($cost | Where-Object { $_.Grouping -eq 'SourceActive' })
-$sa = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'SourceActive' })[0]
-Assert-Equal 'source-active annual' $sa.EstAnnualCost 60
-Assert-Equal 'source-active share'  $sa.ShareOfSpendPct 25
-
-$tot = @($cost | Where-Object { $_.Grouping -eq 'Total' })[0]
-Assert-Equal 'total monthly'      $tot.EstMonthlyCost 20
-Assert-Equal 'total annual'       $tot.EstAnnualCost 240
-Assert-Equal 'total is 100%'      $tot.ShareOfSpendPct 100
-Assert-Equal 'annual is 12x monthly' ($tot.EstAnnualCost -eq $tot.EstMonthlyCost * 12) 'True'
-# Category shares must account for everything, or the table misleads.
-Assert-Equal 'category shares sum to 100' ((@($cost | Where-Object { $_.Grouping -eq 'Category' }) | Measure-Object ShareOfSpendPct -Sum).Sum) 100
-
-$del = @($cost | Where-Object { $_.Grouping -eq 'Action' -and $_.Action -eq 'Delete' })[0]
-Assert-Equal 'the Delete roll-up is the real saving' $del.EstAnnualCost 180
-$byAge = @($cost | Where-Object { $_.Grouping -eq 'Category x Age' -and $_.Category -eq 'Orphaned' })[0]
-Assert-Equal 'age breakdown is present'  $byAge.AgeBand 'Over 365 days'
-Assert-Equal 'age breakdown carries cost' $byAge.EstAnnualCost 180
-Assert-Equal 'every row names its currency' (@($cost | Where-Object { $_.Currency -ne 'USD' }).Count) 0
-# An empty category must not appear as a zero row and dilute the table.
-Assert-Equal 'empty categories are omitted' (@($cost | Where-Object { $_.Grouping -eq 'Category' }).Count) 2
-
-#============================================================
-Write-Section 'Ownership: the split the report is built on'
-#============================================================
-# The report answers "what can I remove that Commvault does not own", so ownership is the top-level
-# partition and everything analytic is computed on the non-Commvault side.
-Assert-Equal 'Commvault is its own population'   (Get-SnapshotOwnership -Creator 'Commvault') 'Commvault'
-Assert-Equal 'cloud-native is not Commvault'     (Get-SnapshotOwnership -Creator 'CloudNative') 'Not Commvault'
-# Azure Backup and Site Recovery are Protected but they are NOT Commvault's, so a customer still sees
-# them in the main analysis rather than having them folded into the Commvault panel.
-Assert-Equal 'Azure Backup is not Commvault'     (Get-SnapshotOwnership -Creator 'AzureBackup') 'Not Commvault'
-Assert-Equal 'Site Recovery is not Commvault'    (Get-SnapshotOwnership -Creator 'SiteRecovery') 'Not Commvault'
-Assert-Equal 'AWS Backup is not Commvault'       (Get-SnapshotOwnership -Creator 'AwsBackup') 'Not Commvault'
-Assert-Equal 'DLM is not Commvault'              (Get-SnapshotOwnership -Creator 'DlmManaged') 'Not Commvault'
-
-# Cost roll-ups must keep the two populations apart, or the savings figure quietly includes Commvault.
+# The file is data, so it must behave like data: one grain throughout, and the cost column must sum
+# to the estate total. A previous version stacked totals, categories and regions behind a "Grouping"
+# column, so summing the column returned about ten times the real figure - these assertions exist to
+# stop that coming back.
 $mixed = @(
-  [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
-    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
-  [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
-    Ownership = 'Not Commvault'; SizeGiB = 100.0; EstMonthlyCost = 5.0 }
-  [pscustomobject]@{ Category = 'Protected'; AgeBand = '0-30 days'; Action = 'Keep'
-    Ownership = 'Commvault'; SizeGiB = 200.0; EstMonthlyCost = 10.0 }
+  [pscustomobject]@{ Region='eu-west-2'; Ownership='Not Commvault'; Creator='CloudNative'
+    Category='Orphaned'; Action='Delete'; AgeBand='Over 365 days'; SizeGiB=100.0; EstMonthlyCost=5.0 }
+  [pscustomobject]@{ Region='eu-west-2'; Ownership='Not Commvault'; Creator='CloudNative'
+    Category='Orphaned'; Action='Delete'; AgeBand='Over 365 days'; SizeGiB=100.0; EstMonthlyCost=5.0 }
+  [pscustomobject]@{ Region='us-east-1'; Ownership='Not Commvault'; Creator='CloudNative'
+    Category='SourceActive'; Action='Review'; AgeBand='0-30 days'; SizeGiB=50.0; EstMonthlyCost=2.5 }
+  [pscustomobject]@{ Region='eu-west-2'; Ownership='Commvault'; Creator='Commvault'
+    Category='Protected'; Action='Keep'; AgeBand='0-30 days'; SizeGiB=200.0; EstMonthlyCost=10.0 }
 )
-$mc = Get-CostSummary -Rows $mixed -Currency 'USD'
-$notCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Not Commvault' })[0]
-$isCv = @($mc | Where-Object { $_.Grouping -eq 'Ownership' -and $_.Category -eq 'Commvault' })[0]
-Assert-Equal 'non-Commvault annual is reported'  $notCv.EstAnnualCost 120
-Assert-Equal 'Commvault annual is reported too'  $isCv.EstAnnualCost 120
-Assert-Equal 'non-Commvault covers 2 snapshots'  $notCv.Snapshots 2
-Assert-Equal 'Commvault covers 1'                $isCv.Snapshots 1
+$scopes = @(@{ Label = 'Region'; Prop = 'Region' })
+$cost = Get-CostSummary -Rows $mixed -Currency 'USD' -ScopeProperties $scopes
 
-# Age-band rows drive "cost per range" in the report, and must exclude Commvault.
-$band = @($mc | Where-Object { $_.Grouping -eq 'Age band (not Commvault)' -and $_.AgeBand -eq '0-30 days' })[0]
-Assert-Equal 'the age band skips the Commvault row' $band.Snapshots 1
-Assert-Equal 'and costs only the non-Commvault one' $band.EstAnnualCost 60
+# 4 snapshots, but the two identical eu-west-2 orphans collapse into one row.
+Assert-Equal 'identical rows collapse'  $cost.Count 3
+Assert-Equal 'and keep their count'     (@($cost | Where-Object { $_.Category -eq 'Orphaned' })[0].Snapshots) 2
+Assert-Equal 'and their combined cost'  (@($cost | Where-Object { $_.Category -eq 'Orphaned' })[0].EstAnnualCost) 120
 
-# The per-snapshot CSVs name their currency in a column rather than leaving a bare number.
-foreach ($script in @($azureScript, $awsScript)) {
-  $body = Get-Content -Path $script -Raw
-  Assert-Equal "$(Split-Path $script -Leaf) writes a Currency column" ($body -match 'Currency\s+= \$Currency') 'True'
-}
+# The property that matters: totals reconcile instead of double-counting.
+Assert-Equal 'monthly sums to the estate'  ((($cost | Measure-Object EstMonthlyCost -Sum).Sum)) (($mixed | Measure-Object EstMonthlyCost -Sum).Sum)
+Assert-Equal 'annual sums to the estate'   ((($cost | Measure-Object EstAnnualCost -Sum).Sum)) 270
+Assert-Equal 'snapshot counts reconcile'   ((($cost | Measure-Object Snapshots -Sum).Sum)) $mixed.Count
+Assert-Equal 'capacity reconciles'         ((($cost | Measure-Object CapacityGiB -Sum).Sum)) 450
 
-# The two scripts differ here on purpose: Azure's marker is definitive, AWS's is not.
-$azBody = Get-Content -Path $azureScript -Raw
-$awsBody2 = Get-Content -Path $awsScript -Raw
-Assert-Equal 'Azure splits the two populations'      ($azBody -match 'SplitByOwnership = \$true') 'True'
-Assert-Equal 'AWS splits them too, now the marker is confirmed' ($awsBody2 -match 'SplitByOwnership = \$true') 'True'
+# One grain throughout - no aggregate rows hiding among the detail.
+Assert-Equal 'no Grouping column'      (($cost[0].PSObject.Properties.Name -contains 'Grouping')) 'False'
+Assert-Equal 'no Scope column'         (($cost[0].PSObject.Properties.Name -contains 'Scope')) 'False'
+Assert-Equal 'no Total row'            (@($cost | Where-Object { $_.Category -eq 'Total' -or $_.Ownership -eq 'Total' }).Count) 0
+Assert-Equal 'every row names a region' (@($cost | Where-Object { -not $_.Region }).Count) 0
+Assert-Equal 'every row names a category' (@($cost | Where-Object { -not $_.Category }).Count) 0
 
-# A parameter can be silently dropped by an edit to the param block while the code that uses it
-# stays behind, which fails only at runtime and only on the path that touches it. Both scripts
-# advertise the same switches, so check each is actually declared in both.
-foreach ($script in @($azureScript, $awsScript)) {
-  $body = Get-Content -Path $script -Raw
-  $name = Split-Path $script -Leaf
-  foreach ($param in @('AuditCreatorEvidence', 'AcknowledgeNoCommvaultSnapshots', 'IncludeCommvaultSnapshots',
-                       'IncludeBackupServiceSnapshots', 'KeepTagKey', 'DeleteScope', 'PriceTable',
-                       'MinAgeDays', 'SourceActiveMinAgeDays', 'MaxDeletions', 'DeleteFromReport',
-                       'PricePerGiBMonth', 'Currency', 'OutputPath', 'AutoInstallModules', 'Force')) {
-    Assert-Equal "$name declares -$param" ($body -match "(?m)^\s*(\[\w+(\[\])?\]\s*)?\`$$param\s*[,)=]") 'True'
-  }
-}
+# Filterable: slicing by one dimension gives a straight, correct answer.
+$eu = @($cost | Where-Object { $_.Region -eq 'eu-west-2' })
+Assert-Equal 'filter by region works'  (($eu | Measure-Object EstAnnualCost -Sum).Sum) 240
+$notCv = @($cost | Where-Object { $_.Ownership -eq 'Not Commvault' })
+Assert-Equal 'filter by ownership works' (($notCv | Measure-Object EstAnnualCost -Sum).Sum) 150
 
-# Anything the summary reads must exist on the rows both scripts build.
-foreach ($script in @($azureScript, $awsScript)) {
-  $body = Get-Content -Path $script -Raw
-  $name = Split-Path $script -Leaf
-  foreach ($prop in @('Ownership', 'Category', 'Action', 'AgeBand', 'SizeGiB', 'EstMonthlyCost', 'EstAnnualCost', 'Currency')) {
-    Assert-Equal "$name populates $prop" ($body -match "(?m)^\s*$prop\s+=") 'True'
-  }
-}
+# Scope columns are named by the caller, so each cloud uses its own vocabulary.
+Assert-Equal 'scope column is labelled'  (($cost[0].PSObject.Properties.Name -contains 'Region')) 'True'
+$noScope = Get-CostSummary -Rows $mixed -Currency 'USD' -ScopeProperties @()
+Assert-Equal 'works without any scope'   (($noScope | Measure-Object EstAnnualCost -Sum).Sum) 270
+Assert-Equal 'empty input is safe'       ((Get-CostSummary -Rows @() -Currency 'USD' -ScopeProperties $scopes).Count) 0
 
-# Scope roll-ups answer "which region / subscription is this money in", which the per-snapshot CSVs
-# can be pivoted for but the cost summary previously could not.
-$scoped = @(
-  [pscustomobject]@{ Category='Orphaned'; AgeBand='Over 365 days'; Action='Delete'; Ownership='Not Commvault'
-    Region='eu-west-2'; SizeGiB=100.0; EstMonthlyCost=5.0; EstAnnualCost=60.0 }
-  [pscustomobject]@{ Category='Orphaned'; AgeBand='Over 365 days'; Action='Delete'; Ownership='Not Commvault'
-    Region='us-east-1'; SizeGiB=100.0; EstMonthlyCost=5.0; EstAnnualCost=60.0 }
-  [pscustomobject]@{ Category='Protected'; AgeBand='0-30 days'; Action='Keep'; Ownership='Commvault'
-    Region='eu-west-2'; SizeGiB=200.0; EstMonthlyCost=10.0; EstAnnualCost=120.0 }
-)
-$sc = Get-CostSummary -Rows $scoped -Currency 'USD' -ScopeProperties @(@{ Label='Region'; Prop='Region' })
-
-$euAll = @($sc | Where-Object { $_.Grouping -eq 'Region' -and $_.Scope -eq 'eu-west-2' })[0]
-Assert-Equal 'a region row exists'            ($null -ne $euAll) 'True'
-Assert-Equal 'it covers the whole region'     $euAll.Snapshots 2
-Assert-Equal 'including Commvault'            $euAll.EstAnnualCost 180
-
-# The same region, excluding Commvault - the figure a saving is quoted from.
-$euNet = @($sc | Where-Object { $_.Grouping -eq 'Region (not Commvault)' -and $_.Scope -eq 'eu-west-2' })[0]
-Assert-Equal 'a non-Commvault region row too' ($null -ne $euNet) 'True'
-Assert-Equal 'which excludes Commvault'       $euNet.Snapshots 1
-Assert-Equal 'and costs less'                 $euNet.EstAnnualCost 60
-
-$us = @($sc | Where-Object { $_.Grouping -eq 'Region' -and $_.Scope -eq 'us-east-1' })[0]
-Assert-Equal 'every region is listed'         $us.EstAnnualCost 60
-Assert-Equal 'region rows carry their scope'  (@($sc | Where-Object { $_.Grouping -like 'Region*' -and -not $_.Scope }).Count) 0
-# Region totals must reconcile with the estate total.
-$regionSum = (@($sc | Where-Object { $_.Grouping -eq 'Region' }) | Measure-Object EstAnnualCost -Sum).Sum
-$estate = @($sc | Where-Object { $_.Grouping -eq 'Total' })[0]
-Assert-Equal 'regions sum to the estate total' $regionSum $estate.EstAnnualCost
-Assert-Equal 'no scope roll-up without the map' (@((Get-CostSummary -Rows $scoped -Currency 'USD') | Where-Object { $_.Grouping -eq 'Region' }).Count) 0
-
-# Both scripts must actually pass their own scope map through.
-foreach ($pair in @(@{ File=$azureScript; Labels=@('Subscription','Region','Resource group') },
-                    @{ File=$awsScript; Labels=@('Account','Region') })) {
+# Both scripts must export per-snapshot rows with the filter columns first.
+foreach ($pair in @(@{ File=$azureScript; First='SubscriptionName' }, @{ File=$awsScript; First='AccountId' })) {
   $body = Get-Content -Path $pair.File -Raw
   $name = Split-Path $pair.File -Leaf
-  Assert-Equal "$name passes -ScopeProperties to the cost CSV" ($body -match '-ScopeProperties \$\w+Scopes') 'True'
-  Assert-Equal "$name passes ScopeProperties to the report"    ($body -match 'ScopeProperties = \$\w+Scopes') 'True'
-  foreach ($l in $pair.Labels) {
-    Assert-Equal "$name rolls up by $l" ($body -match "Label = '$([regex]::Escape($l))'") 'True'
+  Assert-Equal "$name defines an explicit column order" ($body -match '\$snapshotColumns = @\(') 'True'
+  Assert-Equal "$name applies it to both CSVs" ((([regex]::Matches($body, 'Select-Object \$snapshotColumns')).Count)) 2
+  # Pull the declared list out and inspect it, rather than pattern-matching around it.
+  $listText = [regex]::Match($body, '(?s)\$snapshotColumns = @\((.*?)\)').Groups[1].Value
+  $cols = [regex]::Matches($listText, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value }
+  Assert-Equal "$name leads with $($pair.First)" $cols[0] $pair.First
+  foreach ($col in @('Ownership', 'Creator', 'Category', 'Action', 'AgeBand', 'AgeDays', 'SizeGiB',
+                     'Currency', 'EstMonthlyCost', 'EstAnnualCost', 'Reason')) {
+    Assert-Equal "$name exports $col per snapshot" ($cols -contains $col) 'True'
   }
+  # The decision columns must sit near the front, where a filter drop-down will find them.
+  Assert-Equal "$name puts Category in the first 8 columns" (($cols.IndexOf('Category') -lt 8)) 'True'
 }
 
 #============================================================

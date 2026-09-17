@@ -660,95 +660,52 @@ function Format-MoneyCell {
 }
 
 <#
-Cost rolled up several ways at once, for the report and for the cost CSV.
+Pre-aggregated cost, one row per distinct combination of scope, ownership, creator, category, action
+and age band.
 
-Grouping tells you which roll-up a row belongs to, so one file answers "what does each category cost",
-"what does each category cost at each age" and "what would this run actually save" without needing
-three exports or a pivot table.
+Every row is the same kind of thing, so the file behaves like data: filter it, pivot it, and the
+numbers add up. An earlier version stacked several levels of aggregation in one table behind a
+"Grouping" column - totals beside categories beside regions - which meant summing the cost column
+returned roughly ten times the real figure and any filter silently mixed granularities. Mixed grain
+in one table is a trap, not a convenience.
+
+For anything this does not answer, use the per-snapshot CSV: it carries the same dimensions on every
+row, so it pivots to whatever shape is needed.
 #>
 function Get-CostSummary {
   param(
     [object[]]$Rows,
     [string]$Currency,
-    # Which row properties to roll up by, e.g. @(@{Label='Region'; Prop='Location'}). Cloud-specific,
-    # so each script names its own rather than this function guessing at column names.
+    # Scope columns to include, e.g. @(@{Label='Region'; Prop='Location'}). Cloud-specific, so each
+    # script names its own rather than this function guessing at column names.
     [object[]]$ScopeProperties
   )
 
   $out = [System.Collections.Generic.List[object]]::new()
-  # Shares are of the whole set passed in, not of a filtered view - this function has no $focus.
-  $totalMonthly = [double](($Rows | Measure-Object EstMonthlyCost -Sum).Sum)
+  if (-not $Rows -or $Rows.Count -eq 0) { return $out }
 
-  function New-CostRow {
-    param($Grouping, $Category, $AgeBand, $Action, $Set)
-    $m = [math]::Round([double](($Set | Measure-Object EstMonthlyCost -Sum).Sum), 2)
-    [pscustomobject]@{
-      Grouping        = $Grouping
-      Scope           = ''
-      Category        = $Category
-      AgeBand         = $AgeBand
-      Action          = $Action
-      Snapshots       = $Set.Count
-      CapacityGiB     = [math]::Round([double](($Set | Measure-Object SizeGiB -Sum).Sum), 2)
-      Currency        = $Currency
-      EstMonthlyCost  = $m
-      EstAnnualCost   = [math]::Round($m * 12, 2)
-      ShareOfSpendPct = if ($totalMonthly -gt 0) { [math]::Round(($m / $totalMonthly) * 100, 1) } else { 0 }
-    }
-  }
+  $scopeProps = @($ScopeProperties)
+  $keyProps = @($scopeProps | ForEach-Object { $_.Prop }) + @('Ownership', 'Creator', 'Category', 'Action', 'AgeBand')
 
-  foreach ($own in @('Not Commvault', 'Commvault')) {
-    $set = @($Rows | Where-Object { $_.Ownership -eq $own })
-    if ($set.Count -eq 0) { continue }
-    $row = New-CostRow 'Ownership' '' '' '' $set
-    $row.Category = $own
-    $out.Add($row)
-  }
-  foreach ($cat in $script:CategoryOrder) {
-    $set = @($Rows | Where-Object { $_.Category -eq $cat })
-    if ($set.Count -eq 0) { continue }
-    $out.Add((New-CostRow 'Category' $cat '' '' $set))
-  }
-  # Age bands for the non-Commvault population - the "cost per range" the report leads on.
-  foreach ($band in $script:AgeBandOrder) {
-    $set = @($Rows | Where-Object { $_.AgeBand -eq $band -and $_.Ownership -ne 'Commvault' })
-    if ($set.Count -eq 0) { continue }
-    $row = New-CostRow 'Age band (not Commvault)' '' $band '' $set
-    $out.Add($row)
-  }
-  foreach ($cat in $script:CategoryOrder) {
-    foreach ($band in $script:AgeBandOrder) {
-      $set = @($Rows | Where-Object { $_.Category -eq $cat -and $_.AgeBand -eq $band })
-      if ($set.Count -eq 0) { continue }
-      $out.Add((New-CostRow 'Category x Age' $cat $band '' $set))
-    }
-  }
-  foreach ($act in @('Delete', 'Review', 'Keep')) {
-    $set = @($Rows | Where-Object { $_.Action -eq $act })
-    if ($set.Count -eq 0) { continue }
-    $out.Add((New-CostRow 'Action' '' '' $act $set))
-  }
-  # Scope roll-ups: which subscription/account, and which region, the money sits in. Both the whole
-  # estate and the non-Commvault side, because "what does this region cost" and "what could this
-  # region save" are different questions and a customer asks both.
-  foreach ($sp in $ScopeProperties) {
-    $values = $Rows | ForEach-Object { [string]$_.($sp.Prop) } | Where-Object { $_ } | Sort-Object -Unique
-    foreach ($v in $values) {
-      $set = @($Rows | Where-Object { [string]$_.($sp.Prop) -eq $v })
-      $row = New-CostRow $sp.Label '' '' '' $set
-      $row.Scope = $v
-      $out.Add($row)
+  foreach ($g in ($Rows | Group-Object -Property $keyProps)) {
+    $first = $g.Group[0]
+    $monthly = [math]::Round([double](($g.Group | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 
-      $notCv = @($set | Where-Object { $_.Ownership -ne 'Commvault' })
-      if ($notCv.Count -gt 0) {
-        $row2 = New-CostRow "$($sp.Label) (not Commvault)" '' '' '' $notCv
-        $row2.Scope = $v
-        $out.Add($row2)
-      }
-    }
+    # Ordered so the columns you filter on come first and the numbers last.
+    $row = [ordered]@{}
+    foreach ($sp in $scopeProps) { $row[$sp.Label] = [string]$first.($sp.Prop) }
+    $row['Ownership'] = $first.Ownership
+    $row['Creator'] = $first.Creator
+    $row['Category'] = $first.Category
+    $row['Action'] = $first.Action
+    $row['AgeBand'] = $first.AgeBand
+    $row['Snapshots'] = $g.Group.Count
+    $row['CapacityGiB'] = [math]::Round([double](($g.Group | Measure-Object SizeGiB -Sum).Sum), 2)
+    $row['Currency'] = $Currency
+    $row['EstMonthlyCost'] = $monthly
+    $row['EstAnnualCost'] = [math]::Round($monthly * 12, 2)
+    $out.Add([pscustomobject]$row)
   }
-
-  $out.Add((New-CostRow 'Total' '' '' '' $Rows))
 
   return $out
 }
@@ -1734,11 +1691,24 @@ $totals = @{
 }
 
 if (-not $DeleteFromReport) {
+# Column order for the per-snapshot CSVs. What you filter and sort on comes first, then the money,
+# then the evidence behind the verdict, then the identifiers you only need when acting on a row.
+$snapshotColumns = @(
+  'AccountId', 'Region', 'SnapshotType', 'SnapshotId', 'Name',
+  'Ownership', 'Creator', 'Category', 'Action',
+  'AgeBand', 'AgeDays', 'StartTime',
+  'SizeGiB', 'ProvisionedGiB', 'Currency', 'EstMonthlyCost', 'EstAnnualCost',
+  'SourceExists', 'SourceAttached', 'ReferencedByImage', 'BackedAmi', 'BackedAmiExists',
+  'Reason', 'ActionNote',
+  'StorageTier', 'SizeIsActual', 'Tags', 'Description',
+  'SourceId', 'BackingImageName', 'ProfileUsed'
+)
+
   # -WhatIf:$false so a dry run still produces its reports; only the deletions are simulated.
-  $results | Export-Csv -Path $allCsv -NoTypeInformation -WhatIf:$false
+  $results | Select-Object $snapshotColumns | Export-Csv -Path $allCsv -NoTypeInformation -WhatIf:$false
   Write-Host "[INFO] Full classification written to $allCsv" -ForegroundColor Green
 
-  $toDelete | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
+  $toDelete | Select-Object $snapshotColumns | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
   $actualCount = @($results | Where-Object { $_.SizeIsActual }).Count
   $caveat = if ($actualCount -gt 0) {
     "Sized on what AWS actually bills (full snapshot size) for $actualCount of $($results.Count) snapshot(s), so these figures are close rather than an upper bound."
