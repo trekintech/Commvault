@@ -104,40 +104,32 @@ param (
 
   [switch]$IncludeRdsSnapshots,
 
-  # Regex patterns identifying Commvault-created snapshots, matched against the Name tag AND the
-  # snapshot description. Case-insensitive.
+  # Regex patterns identifying Commvault-created snapshots. Matched against the Name tag, the
+  # description, and the name/tags of the AMI the snapshot backs. Case-insensitive.
   #
-  # UNLIKE AZURE, THESE ARE NOT CONFIRMED. In Azure, Commvault always writes COMMVAULT into the
-  # snapshot name and a CreatedBy=Commvault tag, so detection there is definitive. No equivalent
-  # marker has been confirmed for AWS yet. The patterns below are plausible but unverified, so treat
-  # AWS classification as provisional: run -AuditCreatorEvidence against an account where Commvault
-  # is known to be protecting something, find the marker it really writes, and set it here.
+  # Commvault names its AWS EBS snapshots through the Name tag, in the form
+  #   SP_<n>_<jobid>_<n>_<epoch>      e.g.  SP_2_8465372_40229960_1789636362
+  # where the third field is the Commvault job id and the last is a unix timestamp. Note that the
+  # snapshot DESCRIPTION is no help here: Commvault drives AWS CreateImage, so AWS writes its own
+  # boilerplate ("Created by CreateImage(i-...) for ami-...") and Commvault's own wording never
+  # appears. This is the opposite of Azure, where the marker is in the name and tags.
+  #
+  # Derived from observed snapshots rather than documentation, so confirm it against your own
+  # account with -AuditCreatorEvidence before relying on it for deletion.
   [string[]]$CommvaultNamePattern = @(
-    '^CV_',
-    '^cvsnap',
-    '_CvSnap',
+    '^SP_\d+_\d+_\d+_\d+',
     'commvault',
-    '^GX_',
     '_GX_BACKUP_',
     '_GX_AMI_'
   ),
 
-  # Tag keys (or tag values) identifying Commvault-created snapshots. Case-insensitive.
+  # Tag markers, matched against both tag keys and tag values. Case-insensitive.
   [string[]]$CommvaultTagKey = @(
-    'CV_JobId',
-    'CommvaultJobId',
     'Commvault',
+    'CV_JobId',
     '_GX_BACKUP_',
     '_GX_AMI_'
   ),
-
-  # Write an extra CSV of every distinct tag key and name prefix found, so Commvault patterns can be
-  # built from what this estate actually contains rather than from assumed conventions.
-  [switch]$AuditCreatorEvidence,
-
-  # Proceed with -Delete even though no Commvault snapshots were detected. Required in that case,
-  # because zero detections usually means the patterns missed rather than that Commvault is absent.
-  [switch]$AcknowledgeNoCommvaultSnapshots,
 
   # Treat Commvault snapshots as deletion candidates too. Off by default, and deliberately so.
   [switch]$IncludeCommvaultSnapshots,
@@ -279,6 +271,7 @@ function Get-AwsSnapshotCreator {
     [string]$Description,
     [hashtable]$Tags,
     [string]$OwnerAlias,
+    $ImageInfo,
     [string[]]$CommvaultNamePattern,
     [string[]]$CommvaultTagKey
   )
@@ -288,6 +281,14 @@ function Get-AwsSnapshotCreator {
   if (Test-MatchAnyPattern -Value $nameTag -Patterns $CommvaultNamePattern) { return 'Commvault' }
   if (Test-MatchAnyPattern -Value $Description -Patterns $CommvaultNamePattern) { return 'Commvault' }
   if (Test-TagMatch -Tags $Tags -Patterns $CommvaultTagKey) { return 'Commvault' }
+
+  # A snapshot created by CreateImage carries AWS's boilerplate description and may have no marker of
+  # its own, so fall back to the AMI it backs - that is where Commvault's naming lands.
+  if ($ImageInfo) {
+    if (Test-MatchAnyPattern -Value $ImageInfo.Name -Patterns $CommvaultNamePattern) { return 'Commvault' }
+    if (Test-MatchAnyPattern -Value $ImageInfo.NameTag -Patterns $CommvaultNamePattern) { return 'Commvault' }
+    if (Test-MatchAnyPattern -Value $ImageInfo.TagText -Patterns $CommvaultTagKey) { return 'Commvault' }
+  }
 
   # AWS Backup stamps its recovery points with reserved aws:backup: tags.
   if ($Tags) {
@@ -337,27 +338,54 @@ function Get-TargetRegions {
 }
 
 <#
-Every snapshot id referenced by an AMI's block device mappings, in one region. A snapshot behind a
-registered AMI is in use no matter how long ago its volume disappeared. Deregistered AMIs are gone
-from this list, which is exactly why their snapshots show up as orphans.
+Indexes this region's AMIs, both to know which snapshots are in use and to let a snapshot inherit its
+creator from the image it backs.
+
+That inheritance matters in AWS. Commvault's IntelliSnap drives CreateImage, so the snapshots it
+produces carry AWS's own description and can look anonymous on their own - but the AMI above them
+carries Commvault's naming. Reading the AMI catches snapshots the snapshot-level markers miss.
+
+A snapshot behind a registered AMI is in use no matter how long ago its volume disappeared.
+Deregistered AMIs are gone from this index, which is exactly why their snapshots show up as orphans.
 #>
-function Get-ImageReferencedSnapshotIds {
+function Get-ImageIndex {
   param([hashtable]$CredArgs)
 
-  $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  $bySnapshot = @{}
+  $imageIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
   try {
     foreach ($image in (Get-EC2Image -Owner self @CredArgs -ErrorAction Stop)) {
+      [void]$imageIds.Add($image.ImageId)
+      $tags = ConvertTo-TagHashtable -Tags $image.Tags
+      $info = [pscustomobject]@{
+        ImageId = $image.ImageId
+        Name    = [string]$image.Name
+        NameTag = if ($tags.ContainsKey('Name')) { [string]$tags['Name'] } else { '' }
+        TagText = (($tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
+      }
       foreach ($bdm in $image.BlockDeviceMappings) {
-        if ($bdm.Ebs -and $bdm.Ebs.SnapshotId) { [void]$ids.Add($bdm.Ebs.SnapshotId) }
+        if ($bdm.Ebs -and $bdm.Ebs.SnapshotId) { $bySnapshot[$bdm.Ebs.SnapshotId] = $info }
       }
     }
   } catch {
     Write-Host "[WARN] Could not enumerate AMIs: $($_.Exception.Message)" -ForegroundColor Yellow
   }
-  # Comma prevents PowerShell from enumerating the set on the way out: a bare 'return $X' hands back
-  # $null for an empty set and a plain array otherwise, losing both the type and the case-insensitive
-  # comparer, so every .Contains() downstream either throws or silently turns case-sensitive.
-  return , $ids
+
+  # A pscustomobject is not enumerated on the way out, so the two collections survive intact.
+  return [pscustomobject]@{ BySnapshot = $bySnapshot; ImageIds = $imageIds }
+}
+
+<#
+Pulls the AMI id out of the description AWS writes for a CreateImage snapshot:
+  "Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156"
+Worth having because it survives deregistration - the description still names the AMI long after the
+image itself is gone, which is the clearest possible evidence of the classic AWS orphan.
+#>
+function Get-BackedAmiId {
+  param([string]$Description)
+  if ($Description -match '(ami-[0-9a-fA-F]+)') { return $Matches[1] }
+  return ''
 }
 
 function Test-SnapshotShared {
@@ -1107,12 +1135,16 @@ if ($DeleteFromReport) {
   }
 } else {
   #--- Discovery mode ---
-  $profiles = if ($ProfileName -and $ProfileName.Count -gt 0) { $ProfileName } else { @($null) }
+  # The @() wrapper is load-bearing. Assigning @($null) from an if-statement sends it through the
+  # pipeline, which unrolls the single-element array back to a plain $null - and foreach over $null
+  # runs zero times, so the default credential path would silently scan nothing at all. An empty
+  # string is used as the "no profile" sentinel because it survives the round trip and is still falsy.
+  $profiles = @(if ($ProfileName -and $ProfileName.Count -gt 0) { $ProfileName } else { '' })
 
   foreach ($prof in $profiles) {
     $credArgs = @{}
-    if ($prof) { $credArgs['ProfileName'] = $prof }
-    $profLabel = if ($prof) { $prof } else { '<default credentials>' }
+    if (-not [string]::IsNullOrWhiteSpace($prof)) { $credArgs['ProfileName'] = $prof }
+    $profLabel = if (-not [string]::IsNullOrWhiteSpace($prof)) { $prof } else { '<default credentials>' }
 
     $accountId = 'unknown'
     try {
@@ -1158,16 +1190,16 @@ if ($DeleteFromReport) {
           continue
         }
 
-        $imageSnapIds = Get-ImageReferencedSnapshotIds -CredArgs $regionArgs
+        $imageIndex = Get-ImageIndex -CredArgs $regionArgs
         $unattachedCount = @($volumeAttached.Values | Where-Object { -not $_ }).Count
-        Write-Host "[INFO]   $r : $($snapshots.Count) snapshot(s), $($volumeAttached.Count) volume(s) ($unattachedCount unattached), $($imageSnapIds.Count) AMI-referenced" -ForegroundColor Gray
+        Write-Host "[INFO]   $r : $($snapshots.Count) snapshot(s), $($volumeAttached.Count) volume(s) ($unattachedCount unattached), $($imageIndex.BySnapshot.Count) AMI-referenced" -ForegroundColor Gray
 
         foreach ($snap in $snapshots) {
           $tags = ConvertTo-TagHashtable -Tags $snap.Tags
           $nameTag = if ($tags.ContainsKey('Name')) { $tags['Name'] } else { '' }
 
           $creator = Get-AwsSnapshotCreator -Description $snap.Description -Tags $tags -OwnerAlias $snap.OwnerAlias `
-            -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
+            -ImageInfo $imageInfo -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
 
           $creatorExcluded = switch ($creator) {
             'Commvault' { -not $IncludeCommvaultSnapshots }
@@ -1181,7 +1213,13 @@ if ($DeleteFromReport) {
           $hasVolRef = Test-HasRealVolumeReference -VolumeId $snap.VolumeId
           $volExists = $hasVolRef -and $volumeAttached.ContainsKey($snap.VolumeId)
           $volAttached = $volExists -and $volumeAttached[$snap.VolumeId]
-          $referenced = $imageSnapIds.Contains($snap.SnapshotId)
+          $imageInfo = $imageIndex.BySnapshot[$snap.SnapshotId]
+          $referenced = $null -ne $imageInfo
+
+          # AWS keeps naming the AMI in the description after the image is deregistered, so this
+          # tells us "this snapshot backed an image that no longer exists" - the classic AWS orphan.
+          $backedAmi = Get-BackedAmiId -Description $snap.Description
+          $backedAmiExists = $backedAmi -and $imageIndex.ImageIds.Contains($backedAmi)
           $hasKeepTag = Test-TagKeyPresent -Tags $tags -Keys $KeepTagKey
 
           # Only pay for the sharing call on snapshots that would otherwise be deleted.
@@ -1208,7 +1246,21 @@ if ($DeleteFromReport) {
             -MinAgeDays $MinAgeDays `
             -SourceActiveMinAgeDays $SourceActiveMinAgeDays
 
-          $snapMonthly = Get-SnapshotMonthlyCost -SizeGiB ([double]$snap.VolumeSize) -Tier $snap.StorageTier `
+          # EBS snapshots bill on changed blocks, not on the size of the volume behind them. The
+          # console calls this "Full snapshot size" and it is routinely a fraction of the volume:
+          # an 8 GiB volume commonly yields a ~2 GiB snapshot. Costing the volume size instead would
+          # overstate the bill several times over, so use the real figure whenever the API returns
+          # it and fall back to volume size only when it does not.
+          $provisionedGiB = [double]$snap.VolumeSize
+          $billedGiB = $provisionedGiB
+          $sizeIsActual = $false
+          if (($snap.PSObject.Properties.Name -contains 'FullSnapshotSizeInBytes') -and
+              ($null -ne $snap.FullSnapshotSizeInBytes) -and ([double]$snap.FullSnapshotSizeInBytes -gt 0)) {
+            $billedGiB = [math]::Round([double]$snap.FullSnapshotSizeInBytes / 1GB, 2)
+            $sizeIsActual = $true
+          }
+
+          $snapMonthly = Get-SnapshotMonthlyCost -SizeGiB $billedGiB -Tier $snap.StorageTier `
             -PriceTable $PriceTable -DefaultPrice $PricePerGiBMonth
 
           $tagString = (($tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
@@ -1221,7 +1273,9 @@ if ($DeleteFromReport) {
               SnapshotId        = $snap.SnapshotId
               Name              = $nameTag
               Description       = $snap.Description
-              SizeGiB           = [double]$snap.VolumeSize
+              SizeGiB           = $billedGiB
+              ProvisionedGiB    = $provisionedGiB
+              SizeIsActual      = $sizeIsActual
               EstMonthlyCost    = $snapMonthly
               EstAnnualCost     = [math]::Round($snapMonthly * 12, 2)
               StartTime         = $snap.StartTime
@@ -1231,6 +1285,9 @@ if ($DeleteFromReport) {
               SourceExists      = $volExists
               SourceAttached    = $volAttached
               ReferencedByImage = $referenced
+              BackedAmi         = $backedAmi
+              BackedAmiExists   = $backedAmiExists
+              BackingImageName  = $(if ($imageInfo) { $imageInfo.Name } else { '' })
               StorageTier       = $snap.StorageTier
               Creator           = $creator
               Category          = $cat.Category
@@ -1264,7 +1321,7 @@ if ($DeleteFromReport) {
             $srcId = $rsnap.($set.SrcProp)
 
             $creator = Get-AwsSnapshotCreator -Description $snapId -Tags $tags -OwnerAlias '' `
-              -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
+              -ImageInfo $null -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
 
             $creatorExcluded = switch ($creator) {
               'Commvault' { -not $IncludeCommvaultSnapshots }
@@ -1310,6 +1367,8 @@ if ($DeleteFromReport) {
                 Name              = $snapId
                 Description       = "Source: $srcId"
                 SizeGiB           = $sizeGiB
+                ProvisionedGiB    = $sizeGiB
+                SizeIsActual      = $false
                 EstMonthlyCost    = $rdsMonthly
                 EstAnnualCost     = [math]::Round($rdsMonthly * 12, 2)
                 StartTime         = $created
@@ -1319,6 +1378,9 @@ if ($DeleteFromReport) {
                 SourceExists      = $srcExists
                 SourceAttached    = $srcExists
                 ReferencedByImage = $false
+                BackedAmi         = ''
+                BackedAmiExists   = $false
+                BackingImageName  = ''
                 StorageTier       = ''
                 Creator           = $creator
                 Category          = $cat.Category
@@ -1361,7 +1423,12 @@ if (-not $DeleteFromReport) {
   Write-Host "[INFO] Full classification written to $allCsv" -ForegroundColor Green
 
   $toDelete | Export-Csv -Path $candidateCsv -NoTypeInformation -WhatIf:$false
-  $caveat = 'EBS snapshots bill on changed blocks, so the real saving is lower.'
+  $actualCount = @($results | Where-Object { $_.SizeIsActual }).Count
+  $caveat = if ($actualCount -gt 0) {
+    "Sized on what AWS actually bills (full snapshot size) for $actualCount of $($results.Count) snapshot(s), so these figures are close rather than an upper bound."
+  } else {
+    'Sized on volume size because the API did not report full snapshot size; EBS bills on changed blocks, so the real cost is lower.'
+  }
   if (-not $CheckSharing) { $caveat += ' Sharing was not checked - re-run with -CheckSharing to exclude snapshots shared with other accounts.' }
   New-HtmlReport -Rows $results -Path $htmlPath -Totals $totals -Schema @{
     Title      = 'AWS Snapshot Report'
@@ -1372,7 +1439,7 @@ if (-not $DeleteFromReport) {
       @{ Label = 'Type'; Prop = 'SnapshotType' }
       @{ Label = 'Snapshot'; Prop = 'SnapshotId' }
       @{ Label = 'Name'; Prop = 'Name' }
-      @{ Label = 'GiB'; Prop = 'SizeGiB'; Numeric = $true }
+      @{ Label = 'GiB billed'; Prop = 'SizeGiB'; Numeric = $true }
       @{ Label = "$Currency/yr"; Prop = 'EstAnnualCost'; Numeric = $true }
       @{ Label = 'Age (days)'; Prop = 'AgeDays'; Numeric = $true }
       @{ Label = 'Creator'; Prop = 'Creator' }

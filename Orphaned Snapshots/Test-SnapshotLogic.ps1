@@ -69,7 +69,7 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
-  'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference')
+  'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference', 'Get-BackedAmiId')
 . ([scriptblock]::Create($awsText))
 
 # The shared functions read these at script scope, exactly as they do inside the real scripts.
@@ -201,15 +201,43 @@ Assert-Equal 'null tag list is empty'           ((ConvertTo-TagHashtable -Tags $
 
 # AWS keeps its own, still-unverified pattern set - deliberately NOT Azure's confirmed markers,
 # because no AWS equivalent of the COMMVAULT name stamp has been identified yet.
-$awsCvName = @('^CV_', '^cvsnap', '_CvSnap', 'commvault', '^GX_', '_GX_BACKUP_', '_GX_AMI_')
-$awsCvTag = @('CV_JobId', 'CommvaultJobId', 'Commvault', '_GX_BACKUP_', '_GX_AMI_')
-function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '')
-  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias `
+$awsCvName = @('^SP_\d+_\d+_\d+_\d+', 'commvault', '_GX_BACKUP_', '_GX_AMI_')
+$awsCvTag = @('Commvault', 'CV_JobId', '_GX_BACKUP_', '_GX_AMI_')
+function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Image = $null)
+  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -ImageInfo $Image `
     -CommvaultNamePattern $awsCvName -CommvaultTagKey $awsCvTag
 }
-Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'CV_vol_snap')))) 'Commvault'
+# The real thing, taken verbatim from an AWS console snapshot page.
+$realAwsDesc = 'Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156'
+$realAwsTags = ConvertTo-TagHashtable @((Tag 'Name' 'SP_2_8465372_40229960_1789636362'))
+Assert-Equal 'a real Commvault EBS snapshot'   (AwsCreator $realAwsDesc $realAwsTags) 'Commvault'
+# The description is AWS boilerplate from CreateImage - on its own it proves nothing.
+Assert-Equal 'its description alone is not a marker' (AwsCreator $realAwsDesc @{}) 'CloudNative'
+Assert-Equal 'the SP_ Name tag alone is enough'      (AwsCreator 'anything' $realAwsTags) 'Commvault'
+# A bare SP_ prefix is too loose to be the marker; the full structure is what identifies it.
+Assert-Equal 'SP_ without the full structure is not matched' (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_backup')))) 'CloudNative'
+Assert-Equal 'SP_ with the full structure matches'          (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'SP_9_1234567_7654321_1700000000')))) 'Commvault'
+
+# Commvault drives CreateImage, so an anonymous-looking snapshot inherits from the AMI above it.
+$cvImage = [pscustomobject]@{ ImageId = 'ami-0891867df96c9f156'; Name = 'Commvault_GX_AMI_8465372'; NameTag = ''; TagText = '' }
+$plainImage = [pscustomobject]@{ ImageId = 'ami-1111'; Name = 'golden-ubuntu-2204'; NameTag = ''; TagText = 'env=prod' }
+Assert-Equal 'inherits Commvault from its AMI name' (AwsCreator $realAwsDesc @{} '' $cvImage) 'Commvault'
+Assert-Equal 'inherits from the AMI Name tag' `
+  (AwsCreator $realAwsDesc @{} '' ([pscustomobject]@{ ImageId = 'ami-2'; Name = ''; NameTag = 'CV_GX_AMI_1'; TagText = '' })) 'Commvault'
+Assert-Equal 'inherits from the AMI tags' `
+  (AwsCreator $realAwsDesc @{} '' ([pscustomobject]@{ ImageId = 'ami-3'; Name = ''; NameTag = ''; TagText = 'CreatedBy=Commvault' })) 'Commvault'
+Assert-Equal 'an ordinary AMI confers nothing'  (AwsCreator $realAwsDesc @{} '' $plainImage) 'CloudNative'
+Assert-Equal 'no AMI at all is handled'         (AwsCreator $realAwsDesc @{} '' $null) 'CloudNative'
+
+Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'cv_vol_commvault_snap')))) 'Commvault'
 Assert-Equal 'commvault in description' (AwsCreator 'Created by Commvault IntelliSnap') 'Commvault'
 Assert-Equal '_GX_BACKUP_ tag'          (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag '_GX_BACKUP_' 'true')))) 'Commvault'
+
+# Pulling the AMI id back out of AWS's description - it survives deregistration, which is what makes
+# the classic "AMI was deleted, snapshots were not" case provable rather than inferred.
+Assert-Equal 'extracts the AMI id'        (Get-BackedAmiId $realAwsDesc) 'ami-0891867df96c9f156'
+Assert-Equal 'no AMI in a plain description' (Get-BackedAmiId 'manual snapshot before patching') ''
+Assert-Equal 'empty description is safe'     (Get-BackedAmiId '') ''
 Assert-Equal 'AWS Backup reserved tag'  (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'aws:backup:source-resource' 'vol-1')))) 'AwsBackup'
 Assert-Equal 'AWS Backup description'   (AwsCreator 'AWS Backup service point-in-time') 'AwsBackup'
 Assert-Equal 'DLM reserved tag'         (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'aws:dlm:lifecycle-policy-id' 'policy-1')))) 'DlmManaged'
@@ -351,6 +379,44 @@ Assert-Equal 'age breakdown carries cost' $byAge.EstAnnualCost 180
 Assert-Equal 'every row names its currency' (@($cost | Where-Object { $_.Currency -ne 'USD' }).Count) 0
 # An empty category must not appear as a zero row and dilute the table.
 Assert-Equal 'empty categories are omitted' (@($cost | Where-Object { $_.Grouping -eq 'Category' }).Count) 2
+
+#============================================================
+Write-Section 'Regressions: PowerShell collection-unrolling traps'
+#============================================================
+# Both bugs below shipped and were only caught by running the scripts end to end. They share a root
+# cause: PowerShell unrolls collections through the pipeline, so a collection can arrive somewhere as
+# something other than a collection.
+
+# 1. A single-element array assigned from an if-statement is unrolled back to a bare scalar, and
+#    foreach over $null runs zero times. In the AWS script that meant the default credential path
+#    (no -ProfileName) silently scanned nothing at all and reported a clean, empty estate.
+$noProfiles = $null
+$unrolled = if ($noProfiles -and $noProfiles.Count -gt 0) { $noProfiles } else { @($null) }
+$iterations = 0; foreach ($x in $unrolled) { $iterations++ }
+Assert-Equal 'the unsafe form really does iterate zero times' $iterations 0
+$wrapped = @(if ($noProfiles -and $noProfiles.Count -gt 0) { $noProfiles } else { '' })
+$iterations2 = 0; foreach ($x in $wrapped) { $iterations2++ }
+Assert-Equal 'the @() wrapper restores the single pass' $iterations2 1
+
+$awsBody = Get-Content -Path $awsScript -Raw
+Assert-Equal 'AWS builds its profile list with an @() wrapper' ($awsBody -match '\$profiles = @\(if ') 'True'
+Assert-Equal 'AWS no longer uses the unrolling form'          ($awsBody -notmatch '\$profiles = if ') 'True'
+
+# 2. A bare "return $set" hands back $null for an empty set and a plain array otherwise, losing the
+#    type and the case-insensitive comparer. Every .Contains() downstream then throws or silently
+#    turns case-sensitive. These functions call cloud cmdlets, so assert at the source level.
+foreach ($pair in @(@{ File = $azureScript; Fn = 'Get-ImageReferencedSnapshotIds' },
+                    @{ File = $azureScript; Fn = 'Get-LockedResourceIds' })) {
+  $text = Get-FunctionText -Path $pair.File -Name @($pair.Fn)
+  if (-not $text) { continue }
+  $bare = $text -match 'return\s+\$(ids|set)\s*[}\r\n]'
+  Assert-Equal "$(Split-Path $pair.File -Leaf)/$($pair.Fn) does not bare-return its set" (-not $bare) 'True'
+}
+
+# The AWS image index returns a pscustomobject holding a hashtable and a set. Neither is unrolled,
+# which is the point of wrapping them in an object rather than returning two collections.
+$idxText = Get-FunctionText -Path $awsScript -Name @('Get-ImageIndex')
+Assert-Equal 'the AWS image index returns a single object' ($idxText -match 'return \[pscustomobject\]') 'True'
 
 #============================================================
 Write-Section 'End to end: a realistic estate lands where it should'

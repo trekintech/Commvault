@@ -125,34 +125,32 @@ queried from Commvault, and there is no list to export.
 Defaults: `-CommvaultNamePattern 'COMMVAULT','GXMD_SNAP'` and `-CommvaultTagKey 'Commvault'` (matched
 against tag keys and values). Both stay parameterised if an unusual deployment needs widening.
 
-### AWS — provisional
+### AWS — the marker is the Name tag, not the description
 
-**No equivalent confirmed marker has been identified for AWS yet.** The AWS defaults (`^CV_`,
-`commvault`, `_GX_BACKUP_`, `_GX_AMI_` and friends, matched against the `Name` tag and the snapshot
-description) are plausible but **unverified**. Treat AWS Commvault classification as provisional until
-a real marker is confirmed.
+Commvault names its AWS EBS snapshots through the **`Name` tag**:
 
-To find it, run the evidence audit against an account where Commvault is known to be protecting
-something:
-
-```powershell
-.\AWS_Orphaned_Snapshots.ps1 -Region eu-west-1 -AuditCreatorEvidence
+```
+Snapshot ID   snap-0eb82e4a325e7839b
+Name tag      SP_2_8465372_40229960_1789636362
+Description   Created by CreateImage(i-0dfd5810c1370c38d) for ami-0891867df96c9f156
 ```
 
-That writes `AWS_Creator_Evidence_<ts>.csv` containing four kinds of row:
+The form is `SP_<n>_<jobid>_<n>_<epoch>` — the third field is the Commvault job id (the same series as
+Azure's) and the last is a unix timestamp matching the start time.
 
-| Evidence | What it shows | Why it matters |
-|---|---|---|
-| `TagPair` | Every distinct `key=value` shared by more than one snapshot, **rarest first** | This is what found Azure's marker — `CreatedBy=Commvault` appears immediately. A product marker is rarer than `env`/`owner` tags, so it sorts to the top. |
-| `TagKey` | Every distinct tag key, with counts | Catches a marker key whose value varies per job |
-| `DescriptionPattern` | Descriptions with digits, timestamps, GUIDs and hex **masked** | Raw descriptions are all unique because of job ids. Masked, Commvault's `Created by jobID [<n>] at [<timestamp>] from [<host>]` collapses into one counted template. If Commvault writes the same description in AWS as it does in Azure, **this row will find it.** |
-| `NamePrefix` | The leading token of each name | Catches a naming convention |
+**The description is not a marker.** Commvault drives AWS `CreateImage`, so AWS writes its own
+boilerplate and Commvault's wording never appears. This is the opposite of Azure, where the marker is
+in the name and tags.
 
-When you find the marker, set it and AWS becomes as reliable as Azure:
+Because Commvault goes through `CreateImage`, a snapshot can also carry no marker of its own. So the
+script **inherits the creator from the AMI the snapshot backs** — if the image above it is Commvault's,
+the snapshot is too. That catches what snapshot-level matching misses.
 
-```powershell
-.\AWS_Orphaned_Snapshots.ps1 -CommvaultNamePattern '<what you found>' -CommvaultTagKey '<marker>'
-```
+Defaults: `-CommvaultNamePattern '^SP_\d+_\d+_\d+_\d+','commvault','_GX_BACKUP_','_GX_AMI_'`.
+
+These come from observed snapshots rather than documentation, so confirm against your own account with
+`-AuditCreatorEvidence` before relying on them to delete. If Commvault also writes tags of its own,
+the `TagPair` rows will show them — check the **Tags** tab on a known Commvault snapshot.
 
 ### The zero-detection guard (both clouds)
 
@@ -265,6 +263,13 @@ calculated against **provisioned** size, while Azure incremental snapshots and A
 bill only on changed blocks. The real saving is therefore usually **lower** than shown. Treat these as
 an upper bound for prioritising, not a forecast.
 
+**AWS is more accurate than Azure here.** The AWS script uses the snapshot's *full snapshot size* — the
+figure the console shows and the one AWS bills — whenever the API returns it, keeping the volume size
+in `ProvisionedGiB` for reference. The difference is large: an 8 GiB volume commonly yields a 2.16 GiB
+snapshot, and a 500 GiB volume a 50 GiB one, so costing the volume size would overstate the bill
+several times over. Azure has no equivalent per-snapshot figure for incremental snapshots, so Azure
+costs remain against provisioned size and stay an upper bound.
+
 ---
 
 ## Key parameters
@@ -287,6 +292,7 @@ Shared by both scripts:
 | `-MaxDeletions` | `0` (no cap) | Stop after N successful deletions. |
 | `-DeleteFromReport` | — | Delete exactly the rows in a reviewed CSV. |
 | `-PricePerGiBMonth` | `0.05` | Fallback rate per GiB/month for any tier `-PriceTable` does not name. |
+| *(AWS)* `SizeGiB` vs `ProvisionedGiB` | — | AWS costs on **full snapshot size** (what it actually bills) when the API reports it, with the volume size kept alongside for reference. |
 | `-PriceTable` | — | Per-tier rates, e.g. `@{ 'archive' = 0.0125 }`. Set these before quoting a figure. |
 | `-Currency` | `USD` | Label only; no conversion is done. |
 | `-OutputPath` | `.` | Report destination. |
@@ -311,8 +317,8 @@ cap, keep the scope narrow, and keep the logs.
 ```
 
 Report for several weeks before letting anything delete on a schedule, and do not widen
-`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. **Do not schedule
-the AWS script with `-Delete` until its Commvault marker is confirmed** — nobody is watching the output.
+`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. **Confirm the AWS marker against your own
+account before scheduling the AWS script with `-Delete`** — nobody is watching the output.
 
 ---
 
@@ -322,11 +328,12 @@ the AWS script with `-Delete` until its Commvault marker is confirmed** — nobo
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-123 assertions over the category rules, precedence, age bars, delete scoping, cost arithmetic and
+143 assertions over the category rules, precedence, age bars, delete scoping, cost arithmetic and
 per-tier pricing, the cost roll-ups, the zero-detection guard,
-Azure's confirmed Commvault markers (asserted against the real snapshot name and tags from the portal),
-AWS's provisional ones, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
-and a regression guard on collection returns. It parses the two scripts to lift
+both clouds' Commvault markers (asserted against the real snapshot name, tags and description taken
+from the Azure portal and the AWS console), AMI creator inheritance, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
+and regression guards on two PowerShell collection-unrolling traps that shipped and were only caught
+by running the scripts end to end. It parses the two scripts to lift
 their functions out, so it never touches a cloud and needs no credentials. **Run it after changing any
 detection pattern or age bar.**
 
