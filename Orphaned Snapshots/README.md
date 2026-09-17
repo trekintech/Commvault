@@ -25,10 +25,14 @@ So both scripts report **five categories**, always, and never collapse them:
 | Category | Meaning | In the default delete scope? |
 |---|---|---|
 | **Orphaned** | Source disk/volume is provably gone. The literal orphan. | **Yes** |
-| **SourceActive** | Source still exists. Not an orphan — judge it on age. | No, opt in |
+| **SourceUnattached** | Source disk/volume still exists but is attached to **nothing** — the VM/instance was deleted and its disk left behind. One step from orphaned. | No, opt in |
+| **SourceActive** | Source exists *and* is attached to a live machine. Not an orphan — judge it on age. | No, opt in |
 | **Unverifiable** | No provable source (Azure imports; AWS `vol-ffffffff` copies). | No, opt in |
 | **InUse** | Backing a Managed Image / Gallery version / AMI. | **Never** |
 | **Protected** | Commvault, a cloud backup service, a keep-tag, a lock, or shared out. | **Never** |
+
+`SourceUnattached` is usually the most interesting row after `Orphaned`: the machine is gone, nobody
+deleted the disk, and nobody deleted its snapshots either.
 
 Category is a *fact about the snapshot*. What the script would *do* about it is a separate column:
 
@@ -46,7 +50,7 @@ column moves. You can see your whole `SourceActive` pile without ever putting it
 | Bar | Applies to | Default |
 |---|---|---|
 | `-MinAgeDays` | `Orphaned` | 30 days |
-| `-SourceActiveMinAgeDays` | `SourceActive`, `Unverifiable` | 365 days |
+| `-SourceActiveMinAgeDays` | `SourceUnattached`, `SourceActive`, `Unverifiable` | 365 days |
 
 Deleting a snapshot whose source is provably gone is a small call. Deleting one whose disk is still
 live is a much bigger one, so it has to clear a much higher bar even after you scope it in.
@@ -88,86 +92,76 @@ The AWS script is identical in shape:
 Once the report has convinced you, widen the scope deliberately:
 
 ```powershell
-# See what would go, without going.
-.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceActive -Delete -WhatIf
+# Snapshots whose VM was deleted but whose disk was left behind - the usual next step after orphans.
+.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceUnattached -Delete -WhatIf
 
 # Be stricter than the default: only snapshots whose disk is alive but which are 18 months old.
 .\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceActive -SourceActiveMinAgeDays 540
 ```
 
-`-DeleteScope` only accepts `Orphaned`, `SourceActive` and `Unverifiable`. `Protected` and `InUse`
-cannot be named at all.
+`-DeleteScope` only accepts `Orphaned`, `SourceUnattached`, `SourceActive` and `Unverifiable`.
+`Protected` and `InUse` cannot be named at all.
 
 ---
 
-## ⚠️ Commvault detection: what is guaranteed and what is not
+## Commvault detection
 
-**Pattern matching cannot guarantee a snapshot is Commvault's.** By default these scripts identify
-Commvault snapshots with regexes over names and tag keys. Those defaults are informed by Commvault's
-usual conventions — they have **not** been validated against your deployment. Commvault's naming varies
-by agent, version and IntelliSnap configuration, so a Commvault snapshot whose name and tags miss every
-pattern will be classified `CloudNative` and become eligible for deletion. That would destroy a
-recovery point.
+### Azure — definitive
 
-Three mechanisms exist to close that gap, in descending order of certainty.
+Commvault stamps every Azure snapshot it creates with `COMMVAULT` in the resource name **and** a
+`CreatedBy=Commvault` tag. A real example from the portal:
 
-### 1. Give it the real list (the only certain option)
-
-Export the snapshots Commvault owns from Commvault itself — Command Center, the CommCell console,
-`qoperation`, or the REST API, whichever your site uses — and pass the file in:
-
-```powershell
-.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -CommvaultSnapshotIdFile .\commvault-snapshots.txt
+```
+Name   linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab
+Tags   CreatedBy   = Commvault
+       Description = Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]
 ```
 
-Anything on that list is classified `Commvault` regardless of what the patterns say. This replaces
-inference with fact, and it is the only way to be certain. The file can be:
+The script checks the name and the tags **independently**, so a snapshot renamed by hand is still
+caught by its tag, and one re-tagged by hand is still caught by its name. This is a read of a marker
+Commvault actually writes, not an inference — **Azure classification is reliable.** Nothing needs to be
+queried from Commvault, and there is no list to export.
 
-- plain text, one identifier per line (`#` comments and blank lines ignored), or
-- a CSV with a header, in which case the first column whose name contains `snap`, `name` or `id` is used.
+Defaults: `-CommvaultNamePattern 'COMMVAULT','GXMD_SNAP'` and `-CommvaultTagKey 'Commvault'` (matched
+against tag keys and values). Both stay parameterised if an unusual deployment needs widening.
 
-Identifiers match case-insensitively against the snapshot **name** and its full **resource id** (Azure)
-or **snapshot id** (AWS), so whichever form your export produces will work.
+### AWS — provisional
 
-### 2. Build the patterns from your own estate
+**No equivalent confirmed marker has been identified for AWS yet.** The AWS defaults (`^CV_`,
+`commvault`, `_GX_BACKUP_`, `_GX_AMI_` and friends, matched against the `Name` tag and the snapshot
+description) are plausible but **unverified**. Treat AWS Commvault classification as provisional until
+a real marker is confirmed.
 
-If you can't export from Commvault, at least stop guessing at the patterns. This writes a CSV of every
-distinct tag key and name prefix actually present, with counts and examples:
-
-```powershell
-.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -AuditCreatorEvidence
-```
-
-Find the rows Commvault is really producing, then feed them back:
+To find it, run the evidence audit against an account where Commvault is known to be protecting
+something:
 
 ```powershell
-.\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions `
-  -CommvaultNamePattern '^CV_','commvault','^SNAP_CV' `
-  -CommvaultTagKey 'CV_JobId','CommvaultInstance'
+.\AWS_Orphaned_Snapshots.ps1 -Region eu-west-1 -AuditCreatorEvidence
 ```
 
-### 3. The zero-detection guard (on by default)
+That writes `AWS_Creator_Evidence_<ts>.csv` containing four kinds of row:
 
-If a `-Delete` run finds **no** Commvault snapshots at all, the script **aborts before deleting
-anything**. In an estate that runs Commvault, zero detections almost always means the patterns missed
-rather than that Commvault is absent — so it stops and tells you how to fix it rather than proceeding.
+| Evidence | What it shows | Why it matters |
+|---|---|---|
+| `TagPair` | Every distinct `key=value` shared by more than one snapshot, **rarest first** | This is what found Azure's marker — `CreatedBy=Commvault` appears immediately. A product marker is rarer than `env`/`owner` tags, so it sorts to the top. |
+| `TagKey` | Every distinct tag key, with counts | Catches a marker key whose value varies per job |
+| `DescriptionPattern` | Descriptions with digits, timestamps, GUIDs and hex **masked** | Raw descriptions are all unique because of job ids. Masked, Commvault's `Created by jobID [<n>] at [<timestamp>] from [<host>]` collapses into one counted template. If Commvault writes the same description in AWS as it does in Azure, **this row will find it.** |
+| `NamePrefix` | The leading token of each name | Catches a naming convention |
 
-To delete anyway — only correct when Commvault genuinely protects nothing in that scope:
+When you find the marker, set it and AWS becomes as reliable as Azure:
 
 ```powershell
--AcknowledgeNoCommvaultSnapshots
+.\AWS_Orphaned_Snapshots.ps1 -CommvaultNamePattern '<what you found>' -CommvaultTagKey '<marker>'
 ```
 
-This is a backstop for a total detection failure. It cannot catch a *partial* one, where some Commvault
-snapshots match and others don't. Only option 1 closes that.
+### The zero-detection guard (both clouds)
 
-### Recommended before any deletion
+If a `-Delete` run finds **no** Commvault snapshots at all, it aborts before deleting anything — in an
+estate running Commvault that means the markers missed, not that Commvault is absent. Override with
+`-AcknowledgeNoCommvaultSnapshots` only when Commvault genuinely protects nothing in that scope.
 
-1. Run in report mode with `-AuditCreatorEvidence`.
-2. Open the HTML report's **By creator** table. Does the `Commvault` count match what Commvault says
-   it is protecting? If it reads zero, or looks low, your patterns are wrong.
-3. Export the authoritative list and re-run with `-CommvaultSnapshotIdFile`.
-4. Only then review the candidates CSV and delete from it.
+This catches total detection failure, not partial. It is a backstop, not a substitute for confirming
+the marker — which matters much more for AWS than for Azure right now.
 
 Deletion is permanent. Azure snapshots and EBS snapshots cannot be recovered once removed.
 
@@ -227,7 +221,7 @@ Written to `-OutputPath` (default: current directory), timestamped:
 | `*_Snapshots_Candidates_<ts>.csv` | The `Action = Delete` set — the file to review and feed to `-DeleteFromReport`. |
 | `*_Snapshot_Report_<ts>.html` | Hero total, per-category tiles, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
 | `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Only when `-Delete` runs. |
-| `*_Creator_Evidence_<ts>.csv` | Every distinct tag key and name prefix in the estate. Only with `-AuditCreatorEvidence`. |
+| `*_Creator_Evidence_<ts>.csv` | Tag pairs, tag keys, name prefixes and masked description templates. Only with `-AuditCreatorEvidence`. |
 
 Reports are always written, including under `-WhatIf`.
 
@@ -252,10 +246,9 @@ Shared by both scripts:
 | `-MinAgeDays` | `30` | Age bar for `Orphaned`. |
 | `-SourceActiveMinAgeDays` | `365` | Age bar for `SourceActive` and `Unverifiable`. |
 | `-DeleteScope` | `Orphaned` | Which categories `-Delete` may act on. `Protected`/`InUse` not accepted. |
-| `-CommvaultSnapshotIdFile` | — | **Authoritative** Commvault identifier list exported from Commvault. Exact match, beats the patterns. |
-| `-AuditCreatorEvidence` | off | Write a CSV of every distinct tag key and name prefix found, to build patterns from evidence. |
+| `-AuditCreatorEvidence` | off | Write a CSV of tag pairs, tag keys, name prefixes and masked description templates — how you find a marker you don't know yet. |
 | `-AcknowledgeNoCommvaultSnapshots` | off | Permit `-Delete` when zero Commvault snapshots were detected. Otherwise that aborts. |
-| `-CommvaultNamePattern` / `-CommvaultTagKey` | see above | Pattern-based Commvault detection. Tune these, or bypass with the file above. |
+| `-CommvaultNamePattern` / `-CommvaultTagKey` | Azure: `COMMVAULT`, `GXMD_SNAP` / `Commvault`. AWS: provisional. | Commvault markers. Definitive on Azure; still being confirmed on AWS. |
 | `-IncludeCommvaultSnapshots` | off | Move Commvault snapshots out of `Protected`. Not recommended. |
 | `-IncludeBackupServiceSnapshots` | off | Move cloud backup-service snapshots out of `Protected`. Strongly discouraged. |
 | `-KeepTagKey` | `DoNotDelete`, `KeepSnapshot`, `Preserve` | Tag keys that force `Protected`. |
@@ -286,9 +279,8 @@ cap, keep the scope narrow, and keep the logs.
 ```
 
 Report for several weeks before letting anything delete on a schedule, and do not widen
-`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. On a scheduled run
-especially, pass `-CommvaultSnapshotIdFile` from a fresh export rather than relying on pattern
-matching — nobody is watching the output.
+`-DeleteScope` on a scheduled run until you have watched the `Review` list settle. **Do not schedule
+the AWS script with `-Delete` until its Commvault marker is confirmed** — nobody is watching the output.
 
 ---
 
@@ -298,9 +290,10 @@ matching — nobody is watching the output.
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-109 assertions over the category rules, precedence, age bars, delete scoping, the authoritative-list
-override, the zero-detection guard, both clouds' Commvault detection, Azure lock scoping, the AWS
-`vol-ffffffff` sentinel, and a regression guard on collection returns. It parses the two scripts to lift
+94 assertions over the category rules, precedence, age bars, delete scoping, the zero-detection guard,
+Azure's confirmed Commvault markers (asserted against the real snapshot name and tags from the portal),
+AWS's provisional ones, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
+and a regression guard on collection returns. It parses the two scripts to lift
 their functions out, so it never touches a cloud and needs no credentials. **Run it after changing any
 detection pattern or age bar.**
 

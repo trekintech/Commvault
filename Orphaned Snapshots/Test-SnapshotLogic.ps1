@@ -65,14 +65,14 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
         'Get-AgeBand', 'Get-SnapshotCategory', 'Get-SnapshotAction', 'Get-RampClass', 'Format-Gib',
         'Test-MatchAnyPattern', 'Test-TagMatch', 'Test-TagKeyPresent', 'Get-AzSnapshotCreator',
         'Test-ResourceGroupFilter', 'Test-IsLocked', 'Test-CommvaultDetection', 'Get-CreatorEvidence',
-        'Import-KnownCommvaultId'))))
+        'Get-DescriptionTemplate'))))
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
   'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference')
 . ([scriptblock]::Create($awsText))
 
-$CategoryOrder = @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+$CategoryOrder = @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
 
 Write-Host "Snapshot logic tests" -ForegroundColor Green
 
@@ -90,10 +90,14 @@ Assert-Equal 'day 366' (Get-AgeBand 366) 'Over 365 days'
 #============================================================
 Write-Section 'Category assignment and its precedence order'
 #============================================================
-$live = @{ SourceExists = $true; HasSourceReference = $true; ReferencedByImage = $false; HasKeepTag = $false
-  IsPinned = $false; PinnedReason = ''; Creator = 'CloudNative'; CreatorExcluded = $false
+$live = @{ SourceExists = $true; SourceAttached = $true; HasSourceReference = $true; ReferencedByImage = $false
+  HasKeepTag = $false; IsPinned = $false; PinnedReason = ''; Creator = 'CloudNative'; CreatorExcluded = $false
 }
-Assert-Equal 'source alive -> SourceActive' ((Get-SnapshotCategory @live).Category) 'SourceActive'
+Assert-Equal 'source alive and attached -> SourceActive' ((Get-SnapshotCategory @live).Category) 'SourceActive'
+
+# The case the report is really for: the VM was deleted but its disk was left behind.
+$t = $live.Clone(); $t.SourceAttached = $false
+Assert-Equal 'source exists but unattached -> SourceUnattached' ((Get-SnapshotCategory @t).Category) 'SourceUnattached'
 
 $t = $live.Clone(); $t.SourceExists = $false
 Assert-Equal 'source gone -> Orphaned' ((Get-SnapshotCategory @t).Category) 'Orphaned'
@@ -114,8 +118,8 @@ $t = $live.Clone(); $t.IsPinned = $true; $t.PinnedReason = 'lock'
 Assert-Equal 'lock or share -> Protected' ((Get-SnapshotCategory @t).Category) 'Protected'
 
 # Precedence matters: a snapshot can satisfy several rules at once and must land on the safest.
-$all = @{ SourceExists = $false; HasSourceReference = $true; ReferencedByImage = $true; HasKeepTag = $true
-  IsPinned = $true; PinnedReason = 'lock'; Creator = 'Commvault'; CreatorExcluded = $true
+$all = @{ SourceExists = $false; SourceAttached = $false; HasSourceReference = $true; ReferencedByImage = $true
+  HasKeepTag = $true; IsPinned = $true; PinnedReason = 'lock'; Creator = 'Commvault'; CreatorExcluded = $true
 }
 Assert-Equal 'Protected outranks everything' ((Get-SnapshotCategory @all).Category) 'Protected'
 $t = $all.Clone(); $t.CreatorExcluded = $false; $t.HasKeepTag = $false; $t.IsPinned = $false
@@ -151,16 +155,21 @@ Assert-Equal 'InUse survives max scope and zero bars'     ((Get-SnapshotAction -
 #============================================================
 Write-Section 'Azure: who created this snapshot'
 #============================================================
-$cvName = @('^CV_', '^cvsnap', '_CvSnap', 'commvault', '^GX_', '_GX_BACKUP_')
-$cvTag = @('CV_JobId', 'CommvaultJobId', 'Commvault', '_GX_BACKUP_', '_GX_AMI_')
-function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null, $Known = $null, $Id = '')
-  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Id $Id -Tags $Tags `
-    -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
+$cvName = @('COMMVAULT', 'GXMD_SNAP')
+$cvTag = @('Commvault')
+function AzCreator { param($Name, $Rg = 'rg1', $Tags = $null)
+  Get-AzSnapshotCreator -Name $Name -ResourceGroupName $Rg -Tags $Tags `
+    -CommvaultNamePattern $cvName -CommvaultTagKey $cvTag
 }
-Assert-Equal 'CV_ name prefix'        (AzCreator 'CV_disk1_snap') 'Commvault'
-Assert-Equal 'case-insensitive match' (AzCreator 'myCOMMVAULTsnap') 'Commvault'
-Assert-Equal 'commvault tag key'      (AzCreator 'snap-2024' 'rg1' @{'CV_JobId' = '12345' }) 'Commvault'
-Assert-Equal 'commvault tag value'    (AzCreator 'snap-2024' 'rg1' @{'CreatedBy' = 'Commvault' }) 'Commvault'
+# The real thing, taken verbatim from an Azure portal snapshot blade.
+$realName = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab'
+$realTags = @{ 'CreatedBy' = 'Commvault'; 'Description' = 'Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]' }
+Assert-Equal 'a real Commvault snapshot, name and tags' (AzCreator $realName 'SAASFAST' $realTags) 'Commvault'
+Assert-Equal 'its name alone is conclusive'             (AzCreator $realName) 'Commvault'
+Assert-Equal 'its tags alone are conclusive'            (AzCreator 'renamed-by-hand' 'rg1' $realTags) 'Commvault'
+Assert-Equal 'the GXMD_SNAP suffix also catches it'     (AzCreator 'something_GXMD_SNAP_ab12') 'Commvault'
+Assert-Equal 'case does not matter'                     (AzCreator 'thing_commvault_snap') 'Commvault'
+Assert-Equal 'CreatedBy=Commvault tag value'            (AzCreator 'snap-2024' 'rg1' @{'CreatedBy' = 'Commvault' }) 'Commvault'
 Assert-Equal 'Azure Backup RG'        (AzCreator 'snap-x' 'AzureBackupRG_westeurope_1') 'AzureBackup'
 Assert-Equal 'Site Recovery name'     (AzCreator 'asr-abc-123') 'SiteRecovery'
 Assert-Equal 'genuinely cloud-native' (AzCreator 'manual-snap-before-patch' 'rg1' @{'env' = 'prod' }) 'CloudNative'
@@ -188,10 +197,13 @@ $ht = ConvertTo-TagHashtable -Tags @((Tag 'Name' 'web01'), (Tag 'env' 'prod'))
 Assert-Equal 'AWS tag list becomes a hashtable' $ht['Name'] 'web01'
 Assert-Equal 'null tag list is empty'           ((ConvertTo-TagHashtable -Tags $null).Count) 0
 
-$awsCvName = $cvName + @('_GX_AMI_')
-function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '', $Known = $null, $SnapId = '')
-  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias -SnapshotId $SnapId `
-    -CommvaultNamePattern $awsCvName -CommvaultTagKey $cvTag -KnownCommvaultIds $Known
+# AWS keeps its own, still-unverified pattern set - deliberately NOT Azure's confirmed markers,
+# because no AWS equivalent of the COMMVAULT name stamp has been identified yet.
+$awsCvName = @('^CV_', '^cvsnap', '_CvSnap', 'commvault', '^GX_', '_GX_BACKUP_', '_GX_AMI_')
+$awsCvTag = @('CV_JobId', 'CommvaultJobId', 'Commvault', '_GX_BACKUP_', '_GX_AMI_')
+function AwsCreator { param($Desc = 'x', $Tags = @{}, $Alias = '')
+  Get-AwsSnapshotCreator -Description $Desc -Tags $Tags -OwnerAlias $Alias `
+    -CommvaultNamePattern $awsCvName -CommvaultTagKey $awsCvTag
 }
 Assert-Equal 'CV_ in the Name tag'     (AwsCreator 'x' (ConvertTo-TagHashtable @((Tag 'Name' 'CV_vol_snap')))) 'Commvault'
 Assert-Equal 'commvault in description' (AwsCreator 'Created by Commvault IntelliSnap') 'Commvault'
@@ -228,117 +240,63 @@ Assert-Equal 'rolls over to TiB'          (Format-Gib 2048) '2 TiB'
 
 
 #============================================================
-Write-Section 'Authoritative Commvault list overrides the patterns'
-#============================================================
-# The whole point: a snapshot named nothing like Commvault, carrying no Commvault tag, is still
-# Commvault if the export from Commvault says so.
-$known = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-[void]$known.Add('weird-legacy-name-2019')
-[void]$known.Add('/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id')
-
-Assert-Equal 'unmatched name is cloud-native without the list' (AzCreator 'weird-legacy-name-2019') 'CloudNative'
-Assert-Equal 'the list reclassifies it as Commvault'           (AzCreator 'weird-legacy-name-2019' 'rg1' $null $known) 'Commvault'
-Assert-Equal 'matching by full resource id also works'         (AzCreator 'anything' 'rg1' $null $known '/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.Compute/snapshots/by-id') 'Commvault'
-Assert-Equal 'list matching is case-insensitive'               (AzCreator 'WEIRD-LEGACY-NAME-2019' 'rg1' $null $known) 'Commvault'
-Assert-Equal 'a name not on the list is unaffected'            (AzCreator 'some-other-snap' 'rg1' $null $known) 'CloudNative'
-Assert-Equal 'AWS: snapshot id on the list'                    (AwsCreator 'x' @{} '' $known 'weird-legacy-name-2019') 'Commvault'
-Assert-Equal 'AWS: id not on the list'                         (AwsCreator 'x' @{} '' $known 'snap-0abc') 'CloudNative'
-
-#============================================================
 Write-Section 'The zero-detection guard'
 #============================================================
 # Finding no Commvault snapshots at all, in an estate with snapshots, means the patterns probably
 # missed. That must stop a delete rather than sail through it.
-Assert-Equal 'some Commvault found -> proceed'   ((Test-CommvaultDetection -CommvaultCount 12 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
-Assert-Equal 'none found -> BLOCKED'             ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'False'
-Assert-Equal 'none found but acknowledged'       ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $true -HasAuthoritativeList $false).Proceed) 'True'
-Assert-Equal 'empty estate is not suspicious'    ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 0 -Acknowledged $false -HasAuthoritativeList $false).Proceed) 'True'
-# An authoritative list that matched nothing is still worth stopping for - the list may be wrong too.
-Assert-Equal 'list supplied but matched nothing -> BLOCKED' ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $true).Proceed) 'False'
-Assert-Equal 'the block explains how to fix it'  (([string](Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false -HasAuthoritativeList $false).Message) -match 'CommvaultSnapshotIdFile') 'True'
+Assert-Equal 'some Commvault found -> proceed'   ((Test-CommvaultDetection -CommvaultCount 12 -TotalCount 300 -Acknowledged $false).Proceed) 'True'
+Assert-Equal 'none found -> BLOCKED'             ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false).Proceed) 'False'
+Assert-Equal 'none found but acknowledged'       ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $true).Proceed) 'True'
+Assert-Equal 'empty estate is not suspicious'    ((Test-CommvaultDetection -CommvaultCount 0 -TotalCount 0 -Acknowledged $false).Proceed) 'True'
+Assert-Equal 'the block explains how to fix it'  (([string](Test-CommvaultDetection -CommvaultCount 0 -TotalCount 300 -Acknowledged $false).Message) -match 'AuditCreatorEvidence') 'True'
 
 #============================================================
-Write-Section 'Creator evidence for building patterns from the real estate'
+Write-Section 'Evidence gathering: finding a marker you do not know yet'
 #============================================================
+# Descriptions carry job ids and timestamps, so raw values are all unique and tell you nothing.
+# Masking the variable parts collapses one code path into one counted template - which is how you
+# spot a product marker in a cloud where you have not yet identified one.
+$realDesc = 'Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]'
+$otherDesc = 'Created by jobID [8462024] at [09/17/2026,11:22:01] from [mas02036c1us02]'
+Assert-Equal 'two runs of the same job collapse together' `
+  ((Get-DescriptionTemplate $realDesc) -eq (Get-DescriptionTemplate $otherDesc)) 'True'
+Assert-Equal 'the identifying wording survives masking' `
+  ((Get-DescriptionTemplate $realDesc) -match 'Created by jobID') 'True'
+Assert-Equal 'digits are masked'    ((Get-DescriptionTemplate $realDesc) -notmatch '8462023') 'True'
+Assert-Equal 'guids are masked'     (Get-DescriptionTemplate 'vol 3f2504e0-4f89-11d3-9a0c-0305e82c3301') 'vol <guid>'
+Assert-Equal 'a different product stays distinct' `
+  ((Get-DescriptionTemplate $realDesc) -ne (Get-DescriptionTemplate 'Created for policy: policy-0abc123')) 'True'
+
 $sample = @(
-  [pscustomobject]@{ Name = 'CV_sql_snap_1'; Tags = 'CV_JobId=99; env=prod'; Creator = 'Commvault' }
-  [pscustomobject]@{ Name = 'CV_sql_snap_2'; Tags = 'CV_JobId=98'; Creator = 'Commvault' }
-  [pscustomobject]@{ Name = 'manual-before-patch'; Tags = 'env=prod'; Creator = 'CloudNative' }
-  [pscustomobject]@{ Name = 'weird_legacy_thing'; Tags = ''; Creator = 'CloudNative' }
+  [pscustomobject]@{ Name = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab'
+    Tags = 'CreatedBy=Commvault; Description=' + $realDesc; Description = $realDesc; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462024_COMMVAULT_GXMD_SNAP_9ff01c'
+    Tags = 'CreatedBy=Commvault; Description=' + $otherDesc; Description = $otherDesc; Creator = 'Commvault' }
+  [pscustomobject]@{ Name = 'manual-before-patch'; Tags = 'env=prod'; Description = ''; Creator = 'CloudNative' }
+  [pscustomobject]@{ Name = 'weird_legacy_thing'; Tags = ''; Description = ''; Creator = 'CloudNative' }
 )
 $ev = Get-CreatorEvidence -Rows $sample
-Assert-Equal 'finds the CV_JobId tag key'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })).Count) 1
-Assert-Equal 'counts that tag key'          ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CV_JobId' })[0]).Count) 2
-Assert-Equal 'finds the env tag key'        ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'env' })).Count) 1
-Assert-Equal 'finds the CV name prefix'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'CV' })[0]).Count) 2
-Assert-Equal 'splits on underscore too'     ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'weird' })).Count) 1
-Assert-Equal 'empty tags do not break it'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
-
-
-#============================================================
-Write-Section 'Regression: collections must survive being returned'
-#============================================================
-# PowerShell enumerates a collection on the way out of a function, so a bare "return $set" hands back
-# $null for an empty set and a plain array otherwise - losing the type and the case-insensitive
-# comparer. Every .Contains() downstream then throws or silently turns case-sensitive. The fix is
-# "return , $set"; these assertions stop it regressing.
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "cv-ids-$([guid]::NewGuid()).txt"
-
-$empty = Import-KnownCommvaultId -Path ''
-Assert-Equal 'no file still returns a real set, not $null' ($null -ne $empty) 'True'
-Assert-Equal 'and it is a HashSet'                         ($empty.GetType().Name) 'HashSet`1'
-Assert-Equal 'and it is empty'                             ($empty.Count) 0
-
-@('snap-one', 'snap-two') | Set-Content -Path $tmp
-$loaded = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'a populated file stays a HashSet' ($loaded.GetType().Name) 'HashSet`1'
-Assert-Equal 'with both entries'                ($loaded.Count) 2
-Assert-Equal 'and keeps its case-insensitive comparer' ($loaded.Contains('SNAP-ONE')) 'True'
-
-# A single-entry file is the case that most easily collapses to a bare string.
-'only-one' | Set-Content -Path $tmp
-$one = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'a one-line file does not collapse to a string' ($one.GetType().Name) 'HashSet`1'
-Assert-Equal 'and still matches'                             ($one.Contains('ONLY-ONE')) 'True'
-
-# Comments and blanks are ignored.
-@('# exported from Commvault', '', 'real-snap', '   ') | Set-Content -Path $tmp
-$filtered = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'comments and blank lines are skipped' ($filtered.Count) 1
-
-# CSV form, as exported from most tools.
-@('SnapshotName,JobId', 'csv-snap-1,900', 'csv-snap-2,901') | Set-Content -Path $tmp
-$csv = Import-KnownCommvaultId -Path $tmp
-Assert-Equal 'CSV export is understood'  ($csv.Count) 2
-Assert-Equal 'CSV picks the right column' ($csv.Contains('csv-snap-1')) 'True'
-
-Remove-Item $tmp -ErrorAction SilentlyContinue
-
-# The other set-returning functions call cloud cmdlets, so assert at the source level instead.
-foreach ($pair in @(@{ File = $azureScript; Fn = 'Get-ImageReferencedSnapshotIds' },
-                    @{ File = $azureScript; Fn = 'Get-LockedResourceIds' },
-                    @{ File = $azureScript; Fn = 'Import-KnownCommvaultId' },
-                    @{ File = $awsScript; Fn = 'Get-ImageReferencedSnapshotIds' },
-                    @{ File = $awsScript; Fn = 'Import-KnownCommvaultId' })) {
-  $text = Get-FunctionText -Path $pair.File -Name @($pair.Fn)
-  # Catches a bare return anywhere in the function, including an early one inside a guard clause.
-  $bare = $text -match 'return\s+\$(ids|set)\s*[}\r\n]'
-  Assert-Equal "$(Split-Path $pair.File -Leaf)/$($pair.Fn) does not bare-return its set" (-not $bare) 'True'
-}
+Assert-Equal 'reports the CreatedBy tag key'   ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq 'CreatedBy' })).Count) 1
+# This is the row that hands you the marker on a plate.
+Assert-Equal 'reports CreatedBy=Commvault as a pair' ((@($ev | Where-Object { $_.Evidence -eq 'TagPair' -and $_.Value -eq 'CreatedBy=Commvault' })[0]).Count) 2
+Assert-Equal 'a per-snapshot value is not a marker'  ((@($ev | Where-Object { $_.Evidence -eq 'TagPair' -and $_.Value -like 'Description=*8462023*' })).Count) 0
+Assert-Equal 'templates the description'             ((@($ev | Where-Object { $_.Evidence -eq 'DescriptionPattern' })[0]).Count) 2
+Assert-Equal 'finds the name prefix'                 ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'linuxbgwsc2' })[0]).Count) 2
+Assert-Equal 'empty tags do not break it'            ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
 
 #============================================================
 Write-Section 'End to end: a realistic estate lands where it should'
 #============================================================
 # The case that started all this - a snapshot whose disk is alive and two years old is NOT an orphan,
 # and must not be deleted under the default scope however old it is.
-$oldButLive = Get-SnapshotCategory -SourceExists $true -HasSourceReference $true -ReferencedByImage $false `
+$oldButLive = Get-SnapshotCategory -SourceExists $true -SourceAttached $true -HasSourceReference $true -ReferencedByImage $false `
   -HasKeepTag $false -IsPinned $false -PinnedReason '' -Creator 'CloudNative' -CreatorExcluded $false
 Assert-Equal 'two-year-old live snapshot is SourceActive' $oldButLive.Category 'SourceActive'
 Assert-Equal '...and is only reviewed by default' ((Get-SnapshotAction -Category $oldButLive.Category -AgeDays 730 -DeleteScope @('Orphaned') @bars).Action) 'Review'
 Assert-Equal '...and deletes only once scoped in'  ((Get-SnapshotAction -Category $oldButLive.Category -AgeDays 730 -DeleteScope @('Orphaned', 'SourceActive') @bars).Action) 'Delete'
 
 # Every category must be one the report knows how to render.
-foreach ($c in @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')) {
+foreach ($c in @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')) {
   Assert-Equal "category '$c' is renderable" ($CategoryOrder -contains $c) 'True'
 }
 

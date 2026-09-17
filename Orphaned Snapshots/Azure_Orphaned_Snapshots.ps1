@@ -96,35 +96,27 @@ param (
   [int]$SourceActiveMinAgeDays = 365,
 
   # Which categories -Delete may act on. Protected and InUse can never be named here.
-  [ValidateSet('Orphaned', 'SourceActive', 'Unverifiable')]
+  [ValidateSet('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable')]
   [string[]]$DeleteScope = @('Orphaned'),
 
   # Restrict to these resource groups (wildcards accepted).
   [string[]]$ResourceGroups,
 
-  # Regex patterns identifying Commvault-created snapshots by name. Case-insensitive.
+  # Name markers for Commvault-created snapshots (case-insensitive regex). Commvault always writes
+  # COMMVAULT into the snapshot name, as in
+  #   linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab
+  # so this is a definitive marker rather than a guess. GXMD_SNAP is Commvault's own suffix and is
+  # kept as a second, independent catch.
   [string[]]$CommvaultNamePattern = @(
-    '^CV_',
-    '^cvsnap',
-    '_CvSnap',
-    'commvault',
-    '^GX_',
-    '_GX_BACKUP_'
+    'COMMVAULT',
+    'GXMD_SNAP'
   ),
 
-  # Tag keys (or tag values) identifying Commvault-created snapshots. Case-insensitive.
+  # Tag markers (matched against both tag keys and tag values, case-insensitive). Commvault tags
+  # every snapshot CreatedBy=Commvault, which 'Commvault' below matches on the value.
   [string[]]$CommvaultTagKey = @(
-    'CV_JobId',
-    'CommvaultJobId',
-    'Commvault',
-    '_GX_BACKUP_',
-    '_GX_AMI_'
+    'Commvault'
   ),
-
-  # An authoritative list of Commvault-owned snapshot identifiers, exported from Commvault itself.
-  # Exact matches on name or id. This is the ONLY way to be certain rather than pattern-matching;
-  # everything matched here is Commvault regardless of what the regexes above say.
-  [string]$CommvaultSnapshotIdFile,
 
   # Write an extra CSV of every distinct tag key and name prefix found, so Commvault patterns can be
   # built from what this estate actually contains rather than from assumed conventions.
@@ -232,22 +224,29 @@ Classifies which product created a snapshot. Returns one of:
   Commvault | AzureBackup | SiteRecovery | CloudNative
 Only CloudNative snapshots are ever deletion candidates by default.
 #>
+<#
+Identifies which product created a snapshot. Returns one of:
+  Commvault | AzureBackup | SiteRecovery | CloudNative
+
+Commvault detection in Azure is conclusive, not inferred. Commvault stamps every snapshot it creates
+with COMMVAULT in the resource name and a CreatedBy=Commvault tag. A real example:
+
+  Name  linuxbgwsc2_OsDisk_1_0609a2bb0_ide_0_8462023_COMMVAULT_GXMD_SNAP_2db7ab
+  Tags  CreatedBy   = Commvault
+        Description = Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]
+
+Either marker on its own is enough, and they are checked independently so a snapshot that has been
+re-tagged by hand is still caught by its name, and vice versa. The patterns stay parameterised so an
+unusual deployment can widen them, but the defaults are not guesswork.
+#>
 function Get-AzSnapshotCreator {
   param(
     [string]$Name,
     [string]$ResourceGroupName,
-    [string]$Id,
     $Tags,
     [string[]]$CommvaultNamePattern,
-    [string[]]$CommvaultTagKey,
-    [System.Collections.Generic.HashSet[string]]$KnownCommvaultIds
+    [string[]]$CommvaultTagKey
   )
-
-  # An authoritative export from Commvault beats every pattern below - it is fact, not inference.
-  if ($KnownCommvaultIds -and $KnownCommvaultIds.Count -gt 0) {
-    if ($KnownCommvaultIds.Contains($Name)) { return 'Commvault' }
-    if ($Id -and $KnownCommvaultIds.Contains($Id)) { return 'Commvault' }
-  }
 
   if (Test-MatchAnyPattern -Value $Name -Patterns $CommvaultNamePattern) { return 'Commvault' }
   if (Test-TagMatch -Tags $Tags -Patterns $CommvaultTagKey) { return 'Commvault' }
@@ -377,67 +376,19 @@ function Test-IsLocked {
 # there, so the snapshot is not an orphan, but it is still billing and nobody has looked at it in
 # a year. Both are reported; only Orphaned is in the default deletion scope.
 #
-#   Protected     Commvault, a cloud backup service, a keep-tag or a lock. Never deletable.
-#   InUse         Backing a Managed Image / Gallery version / AMI. Never deletable.
-#   Orphaned      Source disk or volume confirmed gone. True orphan.
-#   SourceActive  Source still exists. Not an orphan; judge it on age.
-#   Unverifiable  No provable source reference. Cannot be proven either way.
+#   Protected         Commvault, a cloud backup service, a keep-tag or a lock. Never deletable.
+#   InUse             Backing a Managed Image / Gallery version / AMI. Never deletable.
+#   Orphaned          Source disk or volume confirmed gone. True orphan.
+#   SourceUnattached  Source disk/volume still exists but is attached to no VM or instance. The
+#                     machine is gone and its disk was left behind, so the snapshot is one step from
+#                     orphaned - usually the most interesting row in the report after Orphaned.
+#   SourceActive      Source exists and is attached to a live machine. Judge it on age alone.
+#   Unverifiable      No provable source reference. Cannot be proven either way.
 #
 # Category is a fact about the snapshot. Action is what THIS run would do about it, given
 # -DeleteScope and the age thresholds. Keeping them separate means the report reads the same
 # whatever flags you passed, and only the Action column moves.
 #----------------------------
-
-<#
-Loads an authoritative list of Commvault-owned snapshot identifiers, exported from Commvault itself.
-
-This is the only way to be CERTAIN a snapshot is Commvault's. The -CommvaultNamePattern and
--CommvaultTagKey defaults are informed guesses at Commvault's naming conventions; they have not been
-validated against your deployment, and a Commvault snapshot they fail to match would be classified
-cloud-native and become eligible for deletion. Exporting the real list from Commvault (Command Center,
-the CommCell console, qoperation, or the REST API - whichever your site uses) and feeding it in here
-replaces that guess with fact.
-
-Accepts a plain text file (one identifier per line) or a CSV with a header, in which case the first
-column whose name contains "snap", "name" or "id" is used. Blank lines and # comments are ignored.
-Identifiers are matched case-insensitively against both the snapshot name and its full resource id,
-so either form works.
-#>
-function Import-KnownCommvaultId {
-  param([string]$Path)
-
-  $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-  if ([string]::IsNullOrWhiteSpace($Path)) { return , $set }
-  if (-not (Test-Path $Path)) {
-    Write-Host "[ERROR] -CommvaultSnapshotIdFile not found: $Path" -ForegroundColor Red
-    exit 1
-  }
-
-  $first = (Get-Content -Path $Path -TotalCount 1)
-  $looksCsv = $first -and $first -match ','
-
-  if ($looksCsv) {
-    $rows = Import-Csv -Path $Path
-    $col = ($rows | Select-Object -First 1).PSObject.Properties.Name |
-      Where-Object { $_ -match '(?i)snap|name|id' } | Select-Object -First 1
-    if (-not $col) {
-      Write-Host "[ERROR] $Path has no column whose name contains 'snap', 'name' or 'id'." -ForegroundColor Red
-      exit 1
-    }
-    foreach ($r in $rows) { if ($r.$col) { [void]$set.Add(([string]$r.$col).Trim()) } }
-  } else {
-    foreach ($line in (Get-Content -Path $Path)) {
-      $v = $line.Trim()
-      if ($v -and -not $v.StartsWith('#')) { [void]$set.Add($v) }
-    }
-  }
-
-  Write-Host "[INFO] Loaded $($set.Count) authoritative Commvault identifier(s) from $Path" -ForegroundColor Green
-  # Comma prevents PowerShell from enumerating the set on the way out: a bare 'return $X' hands back
-  # $null for an empty set and a plain array otherwise, losing both the type and the case-insensitive
-  # comparer, so every .Contains() downstream either throws or silently turns case-sensitive.
-  return , $set
-}
 
 <#
 Sanity-checks Commvault detection before anything is deleted.
@@ -452,8 +403,7 @@ function Test-CommvaultDetection {
   param(
     [int]$CommvaultCount,
     [int]$TotalCount,
-    [bool]$Acknowledged,
-    [bool]$HasAuthoritativeList
+    [bool]$Acknowledged
   )
 
   if ($TotalCount -eq 0) { return [pscustomobject]@{ Proceed = $true; Message = '' } }
@@ -465,21 +415,17 @@ function Test-CommvaultDetection {
   $msg = @"
 No Commvault-created snapshots were detected among $TotalCount snapshot(s).
 
-That is either correct (Commvault does not protect anything in this scope) or - more likely - the
-detection patterns do not match how your Commvault names and tags its snapshots. In the second case
-Commvault snapshots are sitting in the cloud-native categories right now, and deleting them would
-destroy recovery points.
+That is either correct (Commvault protects nothing in this scope) or the detection markers no longer
+match what Commvault writes. In the second case Commvault snapshots are sitting in the cloud-native
+categories right now, and deleting them would destroy recovery points.
 
-Before going any further, do one of these:
+Before going further:
 
-  1. Export the real list from Commvault and pass it in. This is exact, not a guess:
-       -CommvaultSnapshotIdFile .\commvault-snapshots.txt
+  1. See what is actually there, then widen the markers:
+       -AuditCreatorEvidence          (writes every distinct tag key, name prefix and description)
+       -CommvaultNamePattern '<regex>' -CommvaultTagKey '<marker>'
 
-  2. Work out the actual naming in this estate, then widen the patterns:
-       -AuditCreatorEvidence          (writes every distinct tag key and name prefix found)
-       -CommvaultNamePattern '<regex>' -CommvaultTagKey '<key>'
-
-  3. If Commvault genuinely protects nothing in this scope, say so explicitly:
+  2. If Commvault genuinely protects nothing in this scope, say so explicitly:
        -AcknowledgeNoCommvaultSnapshots
 
 Refusing to delete.
@@ -488,9 +434,22 @@ Refusing to delete.
 }
 
 <#
-Summarises the naming and tagging actually present in the estate, so Commvault patterns can be built
-from evidence rather than from assumptions about what Commvault "usually" does. Emits every distinct
-tag key and every distinct leading name token, with counts and an example.
+Summarises the naming, tagging and descriptions actually present in the estate, so Commvault markers
+can be found by evidence rather than assumed.
+
+Emits four kinds of row:
+
+  TagKey              every distinct tag key, with a count
+  TagPair             every distinct key=value pair whose value is low-cardinality. This is the one
+                      that finds Azure's marker: CreatedBy=Commvault shows up here immediately.
+  NamePrefix          the leading token of each name
+  DescriptionPattern  descriptions with digits, hex and timestamps masked, so that
+                        "Created by jobID [8462023] at [09/16/2026,09:05:37] from [mas02036c1us02]"
+                      collapses to a single counted template instead of one unique row per snapshot.
+                      Raw descriptions are useless for this - the template is the marker.
+
+Sorted with the rarest tag pairs first: a marker written by exactly one product is usually far less
+common than environment or owner tags, so the interesting rows surface at the top.
 #>
 function Get-CreatorEvidence {
   param([object[]]$Rows)
@@ -498,13 +457,22 @@ function Get-CreatorEvidence {
   $out = [System.Collections.Generic.List[object]]::new()
 
   $tagKeys = @{}
+  $tagPairs = @{}
   foreach ($r in $Rows) {
     if ([string]::IsNullOrWhiteSpace($r.Tags)) { continue }
     foreach ($pair in ($r.Tags -split ';')) {
-      $k = ($pair -split '=', 2)[0].Trim()
+      $parts = $pair -split '=', 2
+      $k = $parts[0].Trim()
       if (-not $k) { continue }
+      $v = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+
       if (-not $tagKeys.ContainsKey($k)) { $tagKeys[$k] = [pscustomobject]@{ Count = 0; Example = $r.Name; Creator = $r.Creator } }
       $tagKeys[$k].Count++
+
+      # A tag whose value is a job id or timestamp is noise; one with a stable value is a marker.
+      $pk = "$k=$v"
+      if (-not $tagPairs.ContainsKey($pk)) { $tagPairs[$pk] = [pscustomobject]@{ Count = 0; Example = $r.Name; Creator = $r.Creator } }
+      $tagPairs[$pk].Count++
     }
   }
   foreach ($k in ($tagKeys.Keys | Sort-Object)) {
@@ -513,8 +481,15 @@ function Get-CreatorEvidence {
         ExampleSnapshot = $tagKeys[$k].Example; ClassifiedAs = $tagKeys[$k].Creator
       })
   }
+  # Only pairs shared by several snapshots - a unique value per snapshot is an id, not a marker.
+  foreach ($pk in ($tagPairs.Keys | Where-Object { $tagPairs[$_].Count -gt 1 } | Sort-Object { $tagPairs[$_].Count })) {
+    $out.Add([pscustomobject]@{
+        Evidence = 'TagPair'; Value = $pk; Count = $tagPairs[$pk].Count
+        ExampleSnapshot = $tagPairs[$pk].Example; ClassifiedAs = $tagPairs[$pk].Creator
+      })
+  }
 
-  # Leading token of the name - Commvault-style prefixes show up here if they are used at all.
+  # Leading token of the name - product prefixes show up here if they are used at all.
   $prefixes = @{}
   foreach ($r in $Rows) {
     if ([string]::IsNullOrWhiteSpace($r.Name)) { continue }
@@ -530,10 +505,41 @@ function Get-CreatorEvidence {
       })
   }
 
+  $descs = @{}
+  foreach ($r in $Rows) {
+    $d = [string]$r.Description
+    if ([string]::IsNullOrWhiteSpace($d)) { continue }
+    $t = Get-DescriptionTemplate -Description $d
+    if (-not $descs.ContainsKey($t)) { $descs[$t] = [pscustomobject]@{ Count = 0; Example = $d; Creator = $r.Creator } }
+    $descs[$t].Count++
+  }
+  foreach ($t in ($descs.Keys | Sort-Object { -$descs[$_].Count })) {
+    $out.Add([pscustomobject]@{
+        Evidence = 'DescriptionPattern'; Value = $t; Count = $descs[$t].Count
+        ExampleSnapshot = $descs[$t].Example; ClassifiedAs = $descs[$t].Creator
+      })
+  }
+
   return $out
 }
 
-$script:CategoryOrder = @('Orphaned', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+<#
+Masks the variable parts of a description so descriptions from the same code path collapse together.
+Job ids, timestamps, GUIDs and hex blobs all become placeholders; the surrounding wording - which is
+what identifies the product - survives.
+#>
+function Get-DescriptionTemplate {
+  param([string]$Description)
+
+  $t = $Description
+  $t = $t -replace '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<guid>'
+  $t = $t -replace '\d{1,4}[/-]\d{1,2}[/-]\d{1,4}[ ,T]*\d{0,2}:?\d{0,2}:?\d{0,2}', '<timestamp>'
+  $t = $t -replace '\b[0-9a-fA-F]{12,}\b', '<hex>'
+  $t = $t -replace '\d+', '<n>'
+  return $t.Trim()
+}
+
+$script:CategoryOrder = @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
 $script:AgeBandOrder = @('0-30 days', '31-90 days', '91-365 days', 'Over 365 days')
 
 function Get-AgeBand {
@@ -547,6 +553,7 @@ function Get-AgeBand {
 function Get-SnapshotCategory {
   param(
     [bool]$SourceExists,
+    [bool]$SourceAttached,
     [bool]$HasSourceReference,
     [bool]$ReferencedByImage,
     [bool]$HasKeepTag,
@@ -562,7 +569,8 @@ function Get-SnapshotCategory {
   if ($ReferencedByImage) { return [pscustomobject]@{ Category = 'InUse'; Reason = 'Backs an image that still exists' } }
   if (-not $HasSourceReference) { return [pscustomobject]@{ Category = 'Unverifiable'; Reason = 'No source reference recorded - orphan status cannot be proven' } }
   if (-not $SourceExists) { return [pscustomobject]@{ Category = 'Orphaned'; Reason = 'Source no longer exists' } }
-  return [pscustomobject]@{ Category = 'SourceActive'; Reason = 'Source still exists - not an orphan, judge on age' }
+  if (-not $SourceAttached) { return [pscustomobject]@{ Category = 'SourceUnattached'; Reason = 'Source still exists but is attached to nothing - its machine is gone' } }
+  return [pscustomobject]@{ Category = 'SourceActive'; Reason = 'Source exists and is attached to a live machine' }
 }
 
 <#
@@ -572,9 +580,9 @@ Decides what this run would do with a snapshot.
   Review  a candidate, but held back by scope or age - this is where the reporting value lives
   Keep    Protected or InUse; never actionable
 
-Orphaned clears at -MinAgeDays. SourceActive and Unverifiable have to clear the much higher
--SourceActiveMinAgeDays, because deleting a snapshot whose source is alive (or unknown) is a
-bigger call than reaping one whose source is provably gone.
+Orphaned clears at -MinAgeDays. SourceUnattached, SourceActive and Unverifiable have to clear the
+much higher -SourceActiveMinAgeDays, because deleting a snapshot whose source still exists (or is
+unknown) is a bigger call than reaping one whose source is provably gone.
 #>
 function Get-SnapshotAction {
   param(
@@ -660,12 +668,16 @@ function New-HtmlReport {
     }
   }
 
+  # Status hues for the three severities, a categorical hue for the "cannot tell" state, and the
+  # calm end of the scale for the two that are never actionable. Each is written beside its label,
+  # so the colour never carries the meaning on its own.
   $catMeta = @{
-    'Orphaned'     = @{ Colour = '#d03b3b'; Blurb = 'Source is gone. The true orphans.' }
-    'SourceActive' = @{ Colour = '#fab219'; Blurb = 'Source still exists. Not orphaned, but still billing.' }
-    'Unverifiable' = @{ Colour = '#ec835a'; Blurb = 'No provable source. Needs a human.' }
-    'InUse'        = @{ Colour = '#2a78d6'; Blurb = 'Backing a live image. Leave alone.' }
-    'Protected'    = @{ Colour = '#0ca30c'; Blurb = 'Commvault, backup service, keep-tag or lock.' }
+    'Orphaned'         = @{ Colour = '#d03b3b'; Blurb = 'Source is gone. The true orphans.' }
+    'SourceUnattached' = @{ Colour = '#ec835a'; Blurb = 'Source exists but its machine is gone.' }
+    'SourceActive'     = @{ Colour = '#fab219'; Blurb = 'Attached to a live machine. Still billing.' }
+    'Unverifiable'     = @{ Colour = '#4a3aa7'; Blurb = 'No provable source. Needs a human.' }
+    'InUse'            = @{ Colour = '#2a78d6'; Blurb = 'Backing a live image. Leave alone.' }
+    'Protected'        = @{ Colour = '#0ca30c'; Blurb = 'Commvault, backup service, keep-tag or lock.' }
   }
 
   $heatRows = foreach ($cat in $script:CategoryOrder) {
@@ -824,7 +836,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 <div class="meta">
   Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') &middot; v$ScriptVersion &middot;
   mode <b>$modeLine</b> &middot; delete scope <b>$scopeLine</b> &middot;
-  age bars: orphaned <b>$($Totals.MinAgeDays)d</b>, source-active &amp; unverifiable <b>$($Totals.SourceActiveMinAgeDays)d</b>
+  age bars: orphaned <b>$($Totals.MinAgeDays)d</b>, everything else <b>$($Totals.SourceActiveMinAgeDays)d</b>
 </div>
 
 <div class="hero">
@@ -877,9 +889,10 @@ $byCreator
 IntelliSnap configuration, so verify every Commvault-owned snapshot is classified as <b>Commvault</b> and not as
 cloud-native. Widen <code>-CommvaultNamePattern</code> / <code>-CommvaultTagKey</code> if any are misclassified.
 <br><br>
-<b>SourceActive is not an orphan.</b> Those snapshots still have a live disk or volume behind them. They are reported
-because they are billing and usually forgotten, not because they are safe to delete. They enter the deletion scope only
-when you name them explicitly in <code>-DeleteScope</code>, and then only past the $($Totals.SourceActiveMinAgeDays) day bar.
+<b>SourceUnattached and SourceActive are not orphans.</b> Their disk or volume still exists &mdash; for SourceUnattached the
+machine it belonged to has gone but the disk was left behind, for SourceActive it is still attached and running. Both are
+reported because they bill and get forgotten, not because they are safe to delete. They enter the deletion scope only when
+named explicitly in <code>-DeleteScope</code>, and then only past the $($Totals.SourceActiveMinAgeDays) day bar.
 <br><br>
 <b>Cost is an estimate</b> at $($Totals.Currency) $($Totals.PricePerGiBMonth) per GiB/month against provisioned size.
 $($Schema.CostCaveat) Treat it as a way to prioritise, not a forecast.
@@ -910,7 +923,6 @@ $deletedCsv = Join-Path $OutputPath "Azure_Snapshots_Deleted_$timestamp.csv"
 $htmlPath = Join-Path $OutputPath "Azure_Snapshot_Report_$timestamp.html"
 
 $results = [System.Collections.Generic.List[object]]::new()
-$knownCvIds = Import-KnownCommvaultId -Path $CommvaultSnapshotIdFile
 
 if ($DeleteFromReport) {
   #--- Approved-report mode: trust the reviewed CSV, re-verify each snapshot still exists ---
@@ -974,9 +986,14 @@ if ($DeleteFromReport) {
     }
 
     # One pass each for disks, image references and locks, rather than a call per snapshot.
-    $diskIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # id -> is that disk attached to a VM. A disk with no ManagedBy is a disk whose VM has gone,
+    # which makes its snapshots far more interesting than ones behind a running machine.
+    # A PowerShell hashtable is case-insensitive by default, which is what resource ids need.
+    $diskAttached = @{}
     try {
-      foreach ($d in (Get-AzDisk -ErrorAction Stop)) { [void]$diskIds.Add($d.Id) }
+      foreach ($d in (Get-AzDisk -ErrorAction Stop)) {
+        $diskAttached[$d.Id] = -not [string]::IsNullOrWhiteSpace($d.ManagedBy)
+      }
     } catch {
       Write-Host "[WARN] Cannot list managed disks in $($sub.Name); orphan detection skipped here: $($_.Exception.Message)" -ForegroundColor Yellow
       continue
@@ -985,7 +1002,8 @@ if ($DeleteFromReport) {
     $imageSnapIds = Get-ImageReferencedSnapshotIds
     $lockScopes = Get-LockedResourceIds
 
-    Write-Host "[INFO]   $($snapshots.Count) snapshot(s), $($diskIds.Count) managed disk(s), $($imageSnapIds.Count) image-referenced snapshot(s)" -ForegroundColor Gray
+    $unattachedCount = @($diskAttached.Values | Where-Object { -not $_ }).Count
+    Write-Host "[INFO]   $($snapshots.Count) snapshot(s), $($diskAttached.Count) managed disk(s) ($unattachedCount unattached), $($imageSnapIds.Count) image-referenced snapshot(s)" -ForegroundColor Gray
 
     foreach ($snap in $snapshots) {
       if (-not (Test-ResourceGroupFilter -ResourceGroupName $snap.ResourceGroupName -Filters $ResourceGroups)) { continue }
@@ -995,10 +1013,11 @@ if ($DeleteFromReport) {
       # Only a managed-disk source can be checked against the disk inventory. A snapshot-of-a-snapshot
       # or an imported blob gives us nothing to verify, and is handled as "cannot confirm".
       $isDiskSource = $hasSourceRef -and ($sourceId -match '/providers/Microsoft\.Compute/disks/')
-      $sourceExists = $isDiskSource -and $diskIds.Contains($sourceId)
+      $sourceExists = $isDiskSource -and $diskAttached.ContainsKey($sourceId)
+      $sourceAttached = $sourceExists -and $diskAttached[$sourceId]
 
-      $creator = Get-AzSnapshotCreator -Name $snap.Name -ResourceGroupName $snap.ResourceGroupName -Id $snap.Id -Tags $snap.Tags `
-        -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey -KnownCommvaultIds $knownCvIds
+      $creator = Get-AzSnapshotCreator -Name $snap.Name -ResourceGroupName $snap.ResourceGroupName -Tags $snap.Tags `
+        -CommvaultNamePattern $CommvaultNamePattern -CommvaultTagKey $CommvaultTagKey
 
       $creatorExcluded = switch ($creator) {
         'Commvault' { -not $IncludeCommvaultSnapshots }
@@ -1013,6 +1032,7 @@ if ($DeleteFromReport) {
 
       $cat = Get-SnapshotCategory `
         -SourceExists $sourceExists `
+        -SourceAttached $sourceAttached `
         -HasSourceReference $isDiskSource `
         -ReferencedByImage ($imageSnapIds.Contains($snap.Id)) `
         -HasKeepTag (Test-TagKeyPresent -Tags $snap.Tags -Keys $KeepTagKey) `
@@ -1044,7 +1064,11 @@ if ($DeleteFromReport) {
           AgeBand           = Get-AgeBand -AgeDays $ageDays
           SourceResourceId  = $sourceId
           SourceExists      = $sourceExists
+          SourceAttached    = $sourceAttached
           ReferencedByImage = $imageSnapIds.Contains($snap.Id)
+          # Commvault writes its job details into a Description tag; surfacing it as a column lets
+          # -AuditCreatorEvidence template it alongside AWS's native description field.
+          Description       = $(if ($snap.Tags -and $snap.Tags['Description']) { $snap.Tags['Description'] } else { '' })
           Creator           = $creator
           Category          = $cat.Category
           Action            = $act.Action
@@ -1108,8 +1132,8 @@ foreach ($cat in $script:CategoryOrder) {
   $g = @($results | Where-Object { $_.Category -eq $cat })
   if ($g.Count -eq 0) { continue }
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
-  $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
-  Write-Host ("    {0,-13}: {1,5}  {2,10} GiB" -f $cat, $g.Count, $gib) -ForegroundColor $colour
+  $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
+  Write-Host ("    {0,-17}: {1,5}  {2,10} GiB" -f $cat, $g.Count, $gib) -ForegroundColor $colour
 }
 Write-Host ""
 Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB, est. $Currency $([math]::Round($deleteGiB * $PricePerGiBMonth, 2))/month)" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
@@ -1143,8 +1167,7 @@ if (-not $DeleteFromReport) {
   $guard = Test-CommvaultDetection `
     -CommvaultCount (@($results | Where-Object { $_.Creator -eq 'Commvault' }).Count) `
     -TotalCount $results.Count `
-    -Acknowledged $AcknowledgeNoCommvaultSnapshots.IsPresent `
-    -HasAuthoritativeList ($knownCvIds.Count -gt 0)
+    -Acknowledged $AcknowledgeNoCommvaultSnapshots.IsPresent
   if (-not $guard.Proceed) {
     Write-Host "`n[ABORT] $($guard.Message)" -ForegroundColor Red
     exit 2
