@@ -205,14 +205,136 @@ Use these to prioritise, not to forecast.
 
 ## Requirements
 
-**Azure** — PowerShell 7+, `Az.Accounts`, `Az.Compute`, `Az.Resources`. `Reader` to report;
-`Disk Snapshot Contributor` to delete.
+**Azure** — PowerShell 7+, and `Az.Accounts`, `Az.Compute`, `Az.Resources`.
 
-**AWS** — PowerShell 7+, `AWS.Tools.Common`, `AWS.Tools.EC2` (plus `AWS.Tools.RDS` for
-`-IncludeRdsSnapshots`, `AWS.Tools.SecurityToken` for account ids). Describe permissions to report;
-`ec2:DeleteSnapshot` to delete.
+**AWS** — PowerShell 7+, and `AWS.Tools.Common`, `AWS.Tools.EC2`. Add `AWS.Tools.RDS` for
+`-IncludeRdsSnapshots`, and `AWS.Tools.SecurityToken` so reports carry the account id.
 
 Add `-AutoInstallModules` to install what is missing.
+
+---
+
+## Permissions
+
+Reporting needs read access only. Deletion needs one extra permission on top. Grant the read set
+first, run it, and only add the delete permission when you are ready to act.
+
+### Azure
+
+**To report** — the built-in **Reader** role on each subscription in scope is enough. It covers
+everything below.
+
+| Action | Used for |
+|---|---|
+| `Microsoft.Compute/snapshots/read` | Finding the snapshots |
+| `Microsoft.Compute/disks/read` | Whether the source disk still exists, and whether a VM is attached |
+| `Microsoft.Compute/images/read` | Snapshots backing a Managed Image |
+| `Microsoft.Compute/galleries/read`<br>`Microsoft.Compute/galleries/images/read`<br>`Microsoft.Compute/galleries/images/versions/read` | Snapshots backing a Compute Gallery version (skip with `-SkipGalleryCheck`) |
+| `Microsoft.Authorization/locks/read` | Honouring resource locks |
+| `Microsoft.Resources/subscriptions/read` | Enumerating subscriptions for `-AllSubscriptions` |
+
+**To delete**, add `Microsoft.Compute/snapshots/delete`. The built-in **Disk Snapshot Contributor**
+role covers it; **Contributor** also works but grants far more than this needs.
+
+Least-privilege custom role for the delete step:
+
+```json
+{
+  "Name": "Snapshot Cleanup",
+  "IsCustom": true,
+  "Description": "Read snapshot inventory and delete snapshots. No other write access.",
+  "Actions": [
+    "Microsoft.Compute/snapshots/read",
+    "Microsoft.Compute/snapshots/delete",
+    "Microsoft.Compute/disks/read",
+    "Microsoft.Compute/images/read",
+    "Microsoft.Compute/galleries/read",
+    "Microsoft.Compute/galleries/images/read",
+    "Microsoft.Compute/galleries/images/versions/read",
+    "Microsoft.Authorization/locks/read",
+    "Microsoft.Resources/subscriptions/read"
+  ],
+  "NotActions": [],
+  "AssignableScopes": ["/subscriptions/<subscription-id>"]
+}
+```
+
+### AWS
+
+**To report** — the AWS-managed **`ReadOnlyAccess`** policy is more than enough, or use this:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "SnapshotReport",
+    "Effect": "Allow",
+    "Action": [
+      "ec2:DescribeSnapshots",
+      "ec2:DescribeVolumes",
+      "ec2:DescribeImages",
+      "ec2:DescribeRegions",
+      "sts:GetCallerIdentity"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+| Action | Used for |
+|---|---|
+| `ec2:DescribeSnapshots` | Finding the snapshots and their tags |
+| `ec2:DescribeVolumes` | Whether the source volume exists, and whether an instance is attached |
+| `ec2:DescribeImages` | Snapshots backing an AMI, and inheriting Commvault ownership from it |
+| `ec2:DescribeRegions` | Enumerating regions when `-Region` is not given |
+| `sts:GetCallerIdentity` | Labelling the report with the account id (optional) |
+| `ec2:DescribeSnapshotAttribute` | Only with `-CheckSharing` |
+| `rds:DescribeDBInstances`<br>`rds:DescribeDBClusters`<br>`rds:DescribeDBSnapshots`<br>`rds:DescribeDBClusterSnapshots` | Only with `-IncludeRdsSnapshots` |
+
+**To delete**, add `ec2:DeleteSnapshot` — plus `rds:DeleteDBSnapshot` and
+`rds:DeleteDBClusterSnapshot` if you are including RDS:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "SnapshotDelete",
+    "Effect": "Allow",
+    "Action": ["ec2:DeleteSnapshot"],
+    "Resource": "*"
+  }]
+}
+```
+
+`Resource: "*"` is required because the snapshots to delete are not known until the report has run.
+To narrow it, scope the delete statement with a condition on a tag you control, and exclude anything
+you never want touched:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "NeverDeleteCommvaultOrBackupService",
+    "Effect": "Deny",
+    "Action": ["ec2:DeleteSnapshot"],
+    "Resource": "*",
+    "Condition": {
+      "StringLike": {
+        "aws:ResourceTag/commvault:vendor": "*"
+      }
+    }
+  }]
+}
+```
+
+A Deny like that is a useful backstop: the scripts already refuse to delete Commvault snapshots, and
+this stops anything else doing so either.
+
+### Multiple accounts and subscriptions
+
+Azure reads every subscription the signed-in identity can see, so `Reader` at management-group level
+covers a whole tenant. AWS uses one credential profile at a time — pass `-ProfileName prod,dev` and
+give each profile its own role.
 
 ---
 
