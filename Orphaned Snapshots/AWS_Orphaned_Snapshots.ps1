@@ -152,8 +152,15 @@ param (
   # without it, a snapshot shared with another account can still be selected for deletion.
   [switch]$CheckSharing,
 
-  # Snapshot storage price per GiB/month, used for the estimated-saving figure only.
+  # Snapshot storage price per GiB/month, used for the cost estimates. Fallback for any tier the
+  # price table below does not name.
   [double]$PricePerGiBMonth = 0.05,
+
+  # Optional per-tier rates, e.g. @{ 'Standard_LRS' = 0.05; 'Standard_ZRS' = 0.0625 } on Azure or
+  # @{ 'standard' = 0.05; 'archive' = 0.0125 } on AWS. Rates vary by region and agreement, so put
+  # your own in here before quoting a figure to anyone.
+  [hashtable]$PriceTable,
+
   [string]$Currency = 'USD',
 
   # Execution
@@ -434,6 +441,87 @@ Refusing to delete.
 }
 
 <#
+Monthly cost of one snapshot.
+
+Storage tier matters more than any other input here: an AWS archive-tier snapshot is roughly a
+quarter the price of a standard one, and Azure ZRS is dearer than LRS. Applying one flat rate across
+tiers is the quickest way to produce a number that is confidently wrong, so -PriceTable can map each
+tier to its own rate and -PricePerGiBMonth is the fallback for tiers it does not name.
+#>
+function Get-SnapshotMonthlyCost {
+  param(
+    [double]$SizeGiB,
+    [string]$Tier,
+    [hashtable]$PriceTable,
+    [double]$DefaultPrice
+  )
+
+  $rate = $DefaultPrice
+  if ($PriceTable -and -not [string]::IsNullOrWhiteSpace($Tier) -and $PriceTable.ContainsKey($Tier)) {
+    $rate = [double]$PriceTable[$Tier]
+  }
+  return [math]::Round($SizeGiB * $rate, 2)
+}
+
+function Format-Money {
+  param([double]$Amount, [string]$Currency)
+  if ($Amount -ge 1000000) { return "$Currency $([math]::Round($Amount / 1000000, 2))M" }
+  return "$Currency $($Amount.ToString('N0'))"
+}
+
+<#
+Cost rolled up several ways at once, for the report and for the cost CSV.
+
+Grouping tells you which roll-up a row belongs to, so one file answers "what does each category cost",
+"what does each category cost at each age" and "what would this run actually save" without needing
+three exports or a pivot table.
+#>
+function Get-CostSummary {
+  param([object[]]$Rows, [string]$Currency)
+
+  $out = [System.Collections.Generic.List[object]]::new()
+  $totalMonthly = [double](($Rows | Measure-Object EstMonthlyCost -Sum).Sum)
+
+  function New-CostRow {
+    param($Grouping, $Category, $AgeBand, $Action, $Set)
+    $m = [math]::Round([double](($Set | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+    [pscustomobject]@{
+      Grouping        = $Grouping
+      Category        = $Category
+      AgeBand         = $AgeBand
+      Action          = $Action
+      Snapshots       = $Set.Count
+      CapacityGiB     = [math]::Round([double](($Set | Measure-Object SizeGiB -Sum).Sum), 2)
+      Currency        = $Currency
+      EstMonthlyCost  = $m
+      EstAnnualCost   = [math]::Round($m * 12, 2)
+      ShareOfSpendPct = if ($totalMonthly -gt 0) { [math]::Round(($m / $totalMonthly) * 100, 1) } else { 0 }
+    }
+  }
+
+  foreach ($cat in $script:CategoryOrder) {
+    $set = @($Rows | Where-Object { $_.Category -eq $cat })
+    if ($set.Count -eq 0) { continue }
+    $out.Add((New-CostRow 'Category' $cat '' '' $set))
+  }
+  foreach ($cat in $script:CategoryOrder) {
+    foreach ($band in $script:AgeBandOrder) {
+      $set = @($Rows | Where-Object { $_.Category -eq $cat -and $_.AgeBand -eq $band })
+      if ($set.Count -eq 0) { continue }
+      $out.Add((New-CostRow 'Category x Age' $cat $band '' $set))
+    }
+  }
+  foreach ($act in @('Delete', 'Review', 'Keep')) {
+    $set = @($Rows | Where-Object { $_.Action -eq $act })
+    if ($set.Count -eq 0) { continue }
+    $out.Add((New-CostRow 'Action' '' '' $act $set))
+  }
+  $out.Add((New-CostRow 'Total' '' '' '' $Rows))
+
+  return $out
+}
+
+<#
 Summarises the naming, tagging and descriptions actually present in the estate, so Commvault markers
 can be found by evidence rather than assumed.
 
@@ -655,6 +743,9 @@ function New-HtmlReport {
   $reviewRows = @($Rows | Where-Object { $_.Action -eq 'Review' })
   $deleteGib = [math]::Round((($deleteRows | Measure-Object SizeGiB -Sum).Sum), 2)
   $reviewGib = [math]::Round((($reviewRows | Measure-Object SizeGiB -Sum).Sum), 2)
+  $deleteMonthly = [double](($deleteRows | Measure-Object EstMonthlyCost -Sum).Sum)
+  $reviewMonthly = [double](($reviewRows | Measure-Object EstMonthlyCost -Sum).Sum)
+  $totalMonthly = [double](($Rows | Measure-Object EstMonthlyCost -Sum).Sum)
 
   #--- category x age heatmap ---
   $cells = @{}
@@ -731,6 +822,41 @@ function New-HtmlReport {
       "<tr><td>$($_.Name)</td><td class='num'>$($_.Count)</td><td class='num'>$(Format-Gib $gib)</td></tr>"
     }) -join "`n"
 
+  # Cost per category is the question the capacity heatmap cannot answer on its own: a category can
+  # hold a lot of GiB on a cheap tier, or little on an expensive one.
+  $costRows = ($script:CategoryOrder | ForEach-Object {
+      $cat = $_
+      $g = @($Rows | Where-Object { $_.Category -eq $cat })
+      if ($g.Count -eq 0) { return }
+      $gib = [math]::Round([double](($g | Measure-Object SizeGiB -Sum).Sum), 2)
+      $m = [double](($g | Measure-Object EstMonthlyCost -Sum).Sum)
+      $share = if ($totalMonthly -gt 0) { [math]::Round(($m / $totalMonthly) * 100, 1) } else { 0 }
+      $actionable = if ($cat -in $Totals.DeleteScope) { 'In scope' } elseif ($cat -in @('InUse', 'Protected')) { 'Never' } else { 'Opt in' }
+      @"
+<tr>
+  <th scope="row"><span class="dot" style="background:$($catMeta[$cat].Colour)"></span>$cat</th>
+  <td class="num">$($g.Count)</td>
+  <td class="num">$(Format-Gib $gib)</td>
+  <td class="num">$(Format-Money $m $Totals.Currency)</td>
+  <td class="num strong">$(Format-Money ($m * 12) $Totals.Currency)</td>
+  <td class="share"><span class="bar" style="width:$([math]::Min($share, 100))%"></span><span class="pct">$share%</span></td>
+  <td>$actionable</td>
+</tr>
+"@
+    }) -join "`n"
+
+  $costTotalRow = @"
+<tr class="total">
+  <th scope="row">Total</th>
+  <td class="num">$($Rows.Count)</td>
+  <td class="num">$(Format-Gib ([math]::Round([double](($Rows | Measure-Object SizeGiB -Sum).Sum), 2)))</td>
+  <td class="num">$(Format-Money $totalMonthly $Totals.Currency)</td>
+  <td class="num strong">$(Format-Money ($totalMonthly * 12) $Totals.Currency)</td>
+  <td class="share"><span class="pct">100%</span></td>
+  <td></td>
+</tr>
+"@
+
   $scopeLine = ($Totals.DeleteScope -join ', ')
   $modeLine = if ($Totals.DeleteMode) { 'DELETE' } else { 'REPORT ONLY' }
 
@@ -788,6 +914,18 @@ h2 + .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .tile .label { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 7px; }
 .tile .value { font-size: 26px; font-weight: 600; margin-top: 6px; letter-spacing: -0.01em; }
 .tile .sub { font-size: 12px; color: var(--ink-muted); margin-top: 1px; }
+.tile .cost { font-size: 12px; color: var(--ink-2); margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--grid);
+              font-variant-numeric: tabular-nums; }
+.hero .unit { font-size: 22px; font-weight: 400; color: var(--ink-2); letter-spacing: 0; }
+.cost td.strong { font-weight: 600; }
+.cost tr.total th, .cost tr.total td { background: var(--plane); font-weight: 600; border-top: 2px solid var(--rule); }
+.cost th[scope="row"] { font-weight: 600; white-space: nowrap; }
+.share { min-width: 130px; }
+/* Width is a straight percentage of the cell, so the bars stay proportional to each other. No
+   max-width: clamping the top end would make a dominant category look the same as a middling one. */
+.share { display: flex; align-items: center; gap: 8px; }
+.share .bar { height: 8px; border-radius: 2px; background: var(--accent); min-width: 2px; flex: none; }
+.share .pct { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; margin-right: 7px;
        vertical-align: baseline; }
 .tile .label .dot { margin-right: 0; }
@@ -841,9 +979,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 
 <div class="hero">
   <div class="label">Reclaimable on this run</div>
-  <div class="value">$(Format-Gib $deleteGib)</div>
-  <div class="foot">$($deleteRows.Count) snapshot(s) in scope &middot; about $($Totals.Currency) $([math]::Round($deleteGib * $Totals.PricePerGiBMonth, 2)) per month &middot;
-  a further $(Format-Gib $reviewGib) across $($reviewRows.Count) snapshot(s) is held back for review</div>
+  <div class="value">$(Format-Money ($deleteMonthly * 12) $Totals.Currency)<span class="unit"> / year</span></div>
+  <div class="foot"><b>$(Format-Money $deleteMonthly $Totals.Currency) per month</b> &middot; $(Format-Gib $deleteGib) across $($deleteRows.Count) snapshot(s) in scope<br>
+  a further <b>$(Format-Money ($reviewMonthly * 12) $Totals.Currency) per year</b> ($(Format-Gib $reviewGib), $($reviewRows.Count) snapshot(s)) is held back for review &middot;
+  total estate $(Format-Money ($totalMonthly * 12) $Totals.Currency) per year</div>
 </div>
 
 <div class="tiles">
@@ -851,9 +990,24 @@ $(($script:CategoryOrder | ForEach-Object {
   $cat = $_
   $g = @($Rows | Where-Object { $_.Category -eq $cat })
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
-  "<div class='tile'><div class='label'><span class='dot' style='background:$($catMeta[$cat].Colour)'></span>$cat</div><div class='value'>$($g.Count)</div><div class='sub'>$(Format-Gib $gib)</div></div>"
+  $m = [double](($g | Measure-Object EstMonthlyCost -Sum).Sum)
+  "<div class='tile'><div class='label'><span class='dot' style='background:$($catMeta[$cat].Colour)'></span>$cat</div><div class='value'>$($g.Count)</div><div class='sub'>$(Format-Gib $gib)</div><div class='cost'>$(Format-Money ($m * 12) $Totals.Currency)/yr</div></div>"
 }) -join "`n")
 </div>
+
+<h2>What it costs, by category</h2>
+<p class="sub">Where the money actually goes. <b>In scope</b> is what <code>-Delete</code> would remove on this run; <b>Opt in</b> needs naming in <code>-DeleteScope</code>; <b>Never</b> is not deletable at all.</p>
+<div class="scroll"><table class="cost">
+  <thead><tr>
+    <th scope="col">Category</th><th scope="col" class="num">Snapshots</th><th scope="col" class="num">Capacity</th>
+    <th scope="col" class="num">Per month</th><th scope="col" class="num">Per year</th>
+    <th scope="col">Share of spend</th><th scope="col">Deletable</th>
+  </tr></thead>
+  <tbody>
+$costRows
+$costTotalRow
+  </tbody>
+</table></div>
 
 <h2>Where the capacity sits</h2>
 <p class="sub">Category against age. Stronger colour means more capacity. Every cell carries its own total, so the colour is a cue rather than the only reading.</p>
@@ -940,6 +1094,8 @@ if ($DeleteFromReport) {
         SnapshotId   = $row.SnapshotId
         Name         = $row.Name
         SizeGiB      = [double]($row.SizeGiB)
+        EstMonthlyCost = [double]($row.EstMonthlyCost)
+        EstAnnualCost  = [double]($row.EstAnnualCost)
         AgeDays      = [double]($row.AgeDays)
         AgeBand      = $row.AgeBand
         Creator      = $row.Creator
@@ -1052,6 +1208,9 @@ if ($DeleteFromReport) {
             -MinAgeDays $MinAgeDays `
             -SourceActiveMinAgeDays $SourceActiveMinAgeDays
 
+          $snapMonthly = Get-SnapshotMonthlyCost -SizeGiB ([double]$snap.VolumeSize) -Tier $snap.StorageTier `
+            -PriceTable $PriceTable -DefaultPrice $PricePerGiBMonth
+
           $tagString = (($tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
 
           $results.Add([pscustomobject]@{
@@ -1063,6 +1222,8 @@ if ($DeleteFromReport) {
               Name              = $nameTag
               Description       = $snap.Description
               SizeGiB           = [double]$snap.VolumeSize
+              EstMonthlyCost    = $snapMonthly
+              EstAnnualCost     = [math]::Round($snapMonthly * 12, 2)
               StartTime         = $snap.StartTime
               AgeDays           = [math]::Round($ageDays, 1)
               AgeBand           = Get-AgeBand -AgeDays $ageDays
@@ -1138,6 +1299,7 @@ if ($DeleteFromReport) {
 
             # RDS reports allocated storage, not consumed snapshot size.
             $sizeGiB = if ($null -ne $rsnap.AllocatedStorage) { [double]$rsnap.AllocatedStorage } else { 0 }
+            $rdsMonthly = Get-SnapshotMonthlyCost -SizeGiB $sizeGiB -Tier '' -PriceTable $PriceTable -DefaultPrice $PricePerGiBMonth
 
             $results.Add([pscustomobject]@{
                 AccountId         = $accountId
@@ -1148,6 +1310,8 @@ if ($DeleteFromReport) {
                 Name              = $snapId
                 Description       = "Source: $srcId"
                 SizeGiB           = $sizeGiB
+                EstMonthlyCost    = $rdsMonthly
+                EstAnnualCost     = [math]::Round($rdsMonthly * 12, 2)
                 StartTime         = $created
                 AgeDays           = [math]::Round($ageDays, 1)
                 AgeBand           = Get-AgeBand -AgeDays $ageDays
@@ -1179,6 +1343,8 @@ if ($DeleteFromReport) {
 $toDelete = @($results | Where-Object { $_.Action -eq 'Delete' })
 $toReview = @($results | Where-Object { $_.Action -eq 'Review' })
 $deleteGiB = [math]::Round((($toDelete | Measure-Object SizeGiB -Sum).Sum), 2)
+$deleteMonthly = [math]::Round([double](($toDelete | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+$estateMonthly = [math]::Round([double](($results | Measure-Object EstMonthlyCost -Sum).Sum), 2)
 
 $totals = @{
   DeleteMode             = $Delete.IsPresent
@@ -1207,11 +1373,16 @@ if (-not $DeleteFromReport) {
       @{ Label = 'Snapshot'; Prop = 'SnapshotId' }
       @{ Label = 'Name'; Prop = 'Name' }
       @{ Label = 'GiB'; Prop = 'SizeGiB'; Numeric = $true }
+      @{ Label = "$Currency/yr"; Prop = 'EstAnnualCost'; Numeric = $true }
       @{ Label = 'Age (days)'; Prop = 'AgeDays'; Numeric = $true }
       @{ Label = 'Creator'; Prop = 'Creator' }
     )
   }
   Write-Host "[INFO] HTML report written to $htmlPath" -ForegroundColor Green
+
+  $costCsv = Join-Path $OutputPath "AWS_Cost_Summary_$timestamp.csv"
+  Get-CostSummary -Rows $results -Currency $Currency | Export-Csv -Path $costCsv -NoTypeInformation -WhatIf:$false
+  Write-Host "[INFO] Cost summary written to $costCsv" -ForegroundColor Green
 
   if ($AuditCreatorEvidence) {
     $evidenceCsv = Join-Path $OutputPath "AWS_Creator_Evidence_$timestamp.csv"
@@ -1227,10 +1398,13 @@ foreach ($cat in $script:CategoryOrder) {
   if ($g.Count -eq 0) { continue }
   $gib = [math]::Round((($g | Measure-Object SizeGiB -Sum).Sum), 2)
   $colour = switch ($cat) { 'Orphaned' { 'Red' } 'SourceUnattached' { 'Red' } 'SourceActive' { 'Yellow' } 'Unverifiable' { 'Yellow' } default { 'Gray' } }
-  Write-Host ("    {0,-17}: {1,5}  {2,10} GiB" -f $cat, $g.Count, $gib) -ForegroundColor $colour
+  $mo = [math]::Round([double](($g | Measure-Object EstMonthlyCost -Sum).Sum), 2)
+  Write-Host ("    {0,-17}: {1,5}  {2,10} GiB   {3,10}/mo   {4,11}/yr" -f `
+      $cat, $g.Count, $gib, "$Currency $($mo.ToString('N0'))", "$Currency $(($mo * 12).ToString('N0'))") -ForegroundColor $colour
 }
 Write-Host ""
-Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB, est. $Currency $([math]::Round($deleteGiB * $PricePerGiBMonth, 2))/month)" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host "  Estate total        : $Currency $($estateMonthly.ToString('N0'))/month   $Currency $(($estateMonthly * 12).ToString('N0'))/year" -ForegroundColor White
+Write-Host "  In scope to delete  : $($toDelete.Count) ($deleteGiB GiB) - saves $Currency $($deleteMonthly.ToString('N0'))/month, $Currency $(($deleteMonthly * 12).ToString('N0'))/year" -ForegroundColor $(if ($toDelete.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host "  Held for review     : $($toReview.Count)" -ForegroundColor White
 Write-Host "  Delete scope        : $($DeleteScope -join ', ')" -ForegroundColor Gray
 Write-Host ""

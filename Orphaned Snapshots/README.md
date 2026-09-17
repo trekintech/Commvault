@@ -219,7 +219,8 @@ Written to `-OutputPath` (default: current directory), timestamped:
 |---|---|
 | `*_Snapshots_All_<ts>.csv` | Every snapshot, with `Category`, `AgeBand`, `Action`, `Reason` and `ActionNote`. Start here. |
 | `*_Snapshots_Candidates_<ts>.csv` | The `Action = Delete` set — the file to review and feed to `-DeleteFromReport`. |
-| `*_Snapshot_Report_<ts>.html` | Hero total, per-category tiles, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
+| `*_Snapshot_Report_<ts>.html` | Annual-cost headline, per-category tiles, a **cost-by-category table**, a **category × age heatmap**, the in-scope and held-for-review tables, and the by-creator breakdown. |
+| `*_Cost_Summary_<ts>.csv` | Cost rolled up by category, by category × age, and by action, with monthly, annual and share-of-spend. |
 | `*_Snapshots_Deleted_<ts>.csv` | Deletion log with per-snapshot success/failure. Only when `-Delete` runs. |
 | `*_Creator_Evidence_<ts>.csv` | Tag pairs, tag keys, name prefixes and masked description templates. Only with `-AuditCreatorEvidence`. |
 
@@ -229,11 +230,40 @@ The heatmap is the quickest read in the report: it puts capacity against age, so
 in `SourceActive` / `Over 365 days`" is a single glance rather than a spreadsheet exercise. It renders
 in light and dark mode and works down to phone width.
 
-### About the cost estimate
+### Cost
 
-`-PricePerGiBMonth` (default `0.05`) is applied to **provisioned** size for an order-of-magnitude
-figure. Azure incremental snapshots and AWS EBS snapshots both bill only on changed blocks, so the real
-saving is usually lower. Use it to prioritise, not to forecast.
+Every snapshot carries `EstMonthlyCost` and `EstAnnualCost`, and the report answers the money question
+in three places: the headline (annual cost reclaimable on this run), the per-category tiles, and the
+**cost-by-category table** — snapshots, capacity, per month, per year, share of spend, and whether the
+category is deletable at all.
+
+`Get-CostSummary` also writes `*_Cost_Summary_<ts>.csv`, which rolls the same numbers up three ways in
+one file, so a finance conversation does not need a pivot table:
+
+| Grouping | Rows |
+|---|---|
+| `Category` | one per category |
+| `Category x Age` | each category split across the age bands |
+| `Action` | `Delete` (what this run actually saves), `Review`, `Keep` |
+| `Total` | the whole estate |
+
+**Set your own rates before quoting a figure.** `-PricePerGiBMonth` (default `0.05`) is the fallback,
+and `-PriceTable` maps individual storage tiers — this matters, because an AWS archive-tier snapshot is
+roughly a quarter the price of a standard one and Azure ZRS costs more than LRS, so one flat rate
+across tiers produces a confidently wrong number:
+
+```powershell
+# Azure
+-PriceTable @{ 'Standard_LRS' = 0.05; 'Standard_ZRS' = 0.0625 }
+
+# AWS
+-PriceTable @{ 'standard' = 0.05; 'archive' = 0.0125 }
+```
+
+Rates vary by region and agreement, so put your own in. One caveat that no rate fixes: costs are
+calculated against **provisioned** size, while Azure incremental snapshots and AWS EBS snapshots both
+bill only on changed blocks. The real saving is therefore usually **lower** than shown. Treat these as
+an upper bound for prioritising, not a forecast.
 
 ---
 
@@ -256,7 +286,9 @@ Shared by both scripts:
 | `-Force` | off | Skip the interactive `Type DELETE to proceed` gate, for scheduled runs. |
 | `-MaxDeletions` | `0` (no cap) | Stop after N successful deletions. |
 | `-DeleteFromReport` | — | Delete exactly the rows in a reviewed CSV. |
-| `-PricePerGiBMonth` / `-Currency` | `0.05` / `USD` | Cost estimate inputs. |
+| `-PricePerGiBMonth` | `0.05` | Fallback rate per GiB/month for any tier `-PriceTable` does not name. |
+| `-PriceTable` | — | Per-tier rates, e.g. `@{ 'archive' = 0.0125 }`. Set these before quoting a figure. |
+| `-Currency` | `USD` | Label only; no conversion is done. |
 | `-OutputPath` | `.` | Report destination. |
 | `-AutoInstallModules` | off | Install missing modules. |
 
@@ -290,7 +322,8 @@ the AWS script with `-Delete` until its Commvault marker is confirmed** — nobo
 .\Test-SnapshotLogic.ps1          # add -Verbose to list every passing test
 ```
 
-94 assertions over the category rules, precedence, age bars, delete scoping, the zero-detection guard,
+123 assertions over the category rules, precedence, age bars, delete scoping, cost arithmetic and
+per-tier pricing, the cost roll-ups, the zero-detection guard,
 Azure's confirmed Commvault markers (asserted against the real snapshot name and tags from the portal),
 AWS's provisional ones, description templating, Azure lock scoping, the AWS `vol-ffffffff` sentinel,
 and a regression guard on collection returns. It parses the two scripts to lift

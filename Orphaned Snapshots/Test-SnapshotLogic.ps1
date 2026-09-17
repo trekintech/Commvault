@@ -65,14 +65,16 @@ function Write-Section { param([string]$Text) Write-Host "`n$Text" -ForegroundCo
         'Get-AgeBand', 'Get-SnapshotCategory', 'Get-SnapshotAction', 'Get-RampClass', 'Format-Gib',
         'Test-MatchAnyPattern', 'Test-TagMatch', 'Test-TagKeyPresent', 'Get-AzSnapshotCreator',
         'Test-ResourceGroupFilter', 'Test-IsLocked', 'Test-CommvaultDetection', 'Get-CreatorEvidence',
-        'Get-DescriptionTemplate'))))
+        'Get-DescriptionTemplate', 'Get-SnapshotMonthlyCost', 'Format-Money', 'Get-CostSummary'))))
 
 # The AWS helpers share names with the Azure ones but take AWS shapes, so alias them on load.
 $awsText = Get-FunctionText -Path $awsScript -Name @(
   'ConvertTo-TagHashtable', 'Get-AwsSnapshotCreator', 'Test-HasRealVolumeReference')
 . ([scriptblock]::Create($awsText))
 
+# The shared functions read these at script scope, exactly as they do inside the real scripts.
 $CategoryOrder = @('Orphaned', 'SourceUnattached', 'SourceActive', 'Unverifiable', 'InUse', 'Protected')
+$AgeBandOrder = @('0-30 days', '31-90 days', '91-365 days', 'Over 365 days')
 
 Write-Host "Snapshot logic tests" -ForegroundColor Green
 
@@ -283,6 +285,72 @@ Assert-Equal 'a per-snapshot value is not a marker'  ((@($ev | Where-Object { $_
 Assert-Equal 'templates the description'             ((@($ev | Where-Object { $_.Evidence -eq 'DescriptionPattern' })[0]).Count) 2
 Assert-Equal 'finds the name prefix'                 ((@($ev | Where-Object { $_.Evidence -eq 'NamePrefix' -and $_.Value -eq 'linuxbgwsc2' })[0]).Count) 2
 Assert-Equal 'empty tags do not break it'            ((@($ev | Where-Object { $_.Evidence -eq 'TagKey' -and $_.Value -eq '' })).Count) 0
+
+#============================================================
+Write-Section 'Cost: per-tier rates, monthly and annual'
+#============================================================
+# Deliberately round numbers so the arithmetic can be checked by eye.
+Assert-Equal '100 GiB at 0.05 = 5.00/mo'  (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier '' -PriceTable $null -DefaultPrice 0.05) 5
+Assert-Equal '1024 GiB at 0.05 = 51.20'   (Get-SnapshotMonthlyCost -SizeGiB 1024 -Tier '' -PriceTable $null -DefaultPrice 0.05) 51.2
+Assert-Equal 'zero size costs nothing'    (Get-SnapshotMonthlyCost -SizeGiB 0 -Tier '' -PriceTable $null -DefaultPrice 0.05) 0
+
+# A flat rate across tiers is the quickest way to a confidently wrong number: AWS archive is about a
+# quarter of standard, so the table has to win over the default.
+$tiers = @{ 'standard' = 0.05; 'archive' = 0.0125; 'Standard_ZRS' = 0.0625 }
+Assert-Equal 'standard tier uses its own rate' (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'standard' -PriceTable $tiers -DefaultPrice 0.99) 5
+Assert-Equal 'archive tier is cheaper'         (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'archive' -PriceTable $tiers -DefaultPrice 0.99) 1.25
+Assert-Equal 'Azure ZRS is dearer'             (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'Standard_ZRS' -PriceTable $tiers -DefaultPrice 0.99) 6.25
+Assert-Equal 'an unlisted tier falls back'     (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier 'premium_v2' -PriceTable $tiers -DefaultPrice 0.10) 10
+Assert-Equal 'a blank tier falls back'         (Get-SnapshotMonthlyCost -SizeGiB 100 -Tier '' -PriceTable $tiers -DefaultPrice 0.10) 10
+
+Assert-Equal 'money is grouped'      (Format-Money 11136 'USD') 'USD 11,136'
+Assert-Equal 'money rounds to whole' (Format-Money 928.44 'USD') 'USD 928'
+Assert-Equal 'millions are compact'  (Format-Money 2500000 'USD') 'USD 2.5M'
+Assert-Equal 'currency is not hardcoded' (Format-Money 1000 'GBP') 'GBP 1,000'
+
+#============================================================
+Write-Section 'Cost summary rolls up every way the CSV needs'
+#============================================================
+# 3 orphans at 100 GiB and 2 source-active at 50 GiB, all at 0.05/GiB/month.
+#   Orphaned      3 x 100 x 0.05 = 15.00/mo -> 180.00/yr
+#   SourceActive  2 x  50 x 0.05 =  5.00/mo ->  60.00/yr
+#   Total                          20.00/mo -> 240.00/yr, so Orphaned is 75% of spend
+$costSample = @(
+  1..3 | ForEach-Object { [pscustomobject]@{ Category = 'Orphaned'; AgeBand = 'Over 365 days'; Action = 'Delete'
+      SizeGiB = 100.0; EstMonthlyCost = 5.0 } }
+  1..2 | ForEach-Object { [pscustomobject]@{ Category = 'SourceActive'; AgeBand = '0-30 days'; Action = 'Review'
+      SizeGiB = 50.0; EstMonthlyCost = 2.5 } }
+)
+$cost = Get-CostSummary -Rows $costSample -Currency 'USD'
+
+$orph = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'Orphaned' })[0]
+Assert-Equal 'orphaned monthly'  $orph.EstMonthlyCost 15
+Assert-Equal 'orphaned annual'   $orph.EstAnnualCost 180
+Assert-Equal 'orphaned capacity' $orph.CapacityGiB 300
+Assert-Equal 'orphaned count'    $orph.Snapshots 3
+Assert-Equal 'orphaned share'    $orph.ShareOfSpendPct 75
+
+$act = @($cost | Where-Object { $_.Grouping -eq 'SourceActive' })
+$sa = @($cost | Where-Object { $_.Grouping -eq 'Category' -and $_.Category -eq 'SourceActive' })[0]
+Assert-Equal 'source-active annual' $sa.EstAnnualCost 60
+Assert-Equal 'source-active share'  $sa.ShareOfSpendPct 25
+
+$tot = @($cost | Where-Object { $_.Grouping -eq 'Total' })[0]
+Assert-Equal 'total monthly'      $tot.EstMonthlyCost 20
+Assert-Equal 'total annual'       $tot.EstAnnualCost 240
+Assert-Equal 'total is 100%'      $tot.ShareOfSpendPct 100
+Assert-Equal 'annual is 12x monthly' ($tot.EstAnnualCost -eq $tot.EstMonthlyCost * 12) 'True'
+# Category shares must account for everything, or the table misleads.
+Assert-Equal 'category shares sum to 100' ((@($cost | Where-Object { $_.Grouping -eq 'Category' }) | Measure-Object ShareOfSpendPct -Sum).Sum) 100
+
+$del = @($cost | Where-Object { $_.Grouping -eq 'Action' -and $_.Action -eq 'Delete' })[0]
+Assert-Equal 'the Delete roll-up is the real saving' $del.EstAnnualCost 180
+$byAge = @($cost | Where-Object { $_.Grouping -eq 'Category x Age' -and $_.Category -eq 'Orphaned' })[0]
+Assert-Equal 'age breakdown is present'  $byAge.AgeBand 'Over 365 days'
+Assert-Equal 'age breakdown carries cost' $byAge.EstAnnualCost 180
+Assert-Equal 'every row names its currency' (@($cost | Where-Object { $_.Currency -ne 'USD' }).Count) 0
+# An empty category must not appear as a zero row and dilute the table.
+Assert-Equal 'empty categories are omitted' (@($cost | Where-Object { $_.Grouping -eq 'Category' }).Count) 2
 
 #============================================================
 Write-Section 'End to end: a realistic estate lands where it should'
