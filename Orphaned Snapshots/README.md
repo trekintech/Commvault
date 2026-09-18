@@ -1,7 +1,6 @@
 # Cloud Snapshot Savings Report
 
-Find out what a cloud estate is spending on snapshots **Commvault did not create** — and remove them
-safely.
+Find out what a cloud estate is spending on snapshots Commvault didn't create, and remove them safely.
 
 | File | What it does |
 |---|---|
@@ -9,18 +8,19 @@ safely.
 | `AWS_Orphaned_Snapshots.ps1` | AWS EBS snapshots (VM disks). Manual RDS snapshots with `-IncludeRdsSnapshots`. |
 | `Test-SnapshotLogic.ps1` | Offline self-test. No cloud, no credentials. |
 
-Both scripts are **report-only by default**. Nothing is deleted unless you pass `-Delete`.
+Both scripts are report-only by default. Nothing gets deleted unless you pass `-Delete`.
 
 ---
 
 ## The problem
 
-Snapshots outlive whatever they were taken from. Delete an Azure disk and its snapshots stay. Deregister
-an AWS AMI and the snapshots behind it stay. Nobody notices, because neither cloud shows you "snapshots
-with nothing behind them" — and they bill every month, forever.
+Snapshots outlive whatever they were taken from. Delete an Azure disk and its snapshots stick around.
+Deregister an AWS AMI and the snapshots behind it stick around too. Nobody notices, because neither
+cloud has a built-in view of "snapshots with nothing behind them" — they just keep billing every month.
 
-A customer's estate also contains Commvault's own backup snapshots. Those are **not** a saving; deleting
-them breaks recovery points. So the report separates the two and only ever counts the rest.
+A customer's estate will also have Commvault's own backup snapshots sitting in it. Those aren't a
+saving; deleting them breaks recovery points. So the report separates the two and only ever counts the
+rest as a potential saving.
 
 ---
 
@@ -28,32 +28,33 @@ them breaks recovery points. So the report separates the two and only ever count
 
 Run it and you get a terminal summary, an HTML report to share, and CSVs to work from.
 
-**1. Commvault's own snapshots, identified and set aside.** Counted, costed, and excluded from every
-other figure — shown so it is clear they were found, not missed.
+Commvault's own snapshots are identified and set aside first — counted, costed, and excluded from
+every other figure in the report. They're still listed, so it's obvious they were found rather than
+missed.
 
-**2. Everything else, broken down by why it is still there:**
+Everything else is broken down by why it's still hanging around:
 
 | Category | Meaning |
 |---|---|
-| **Orphaned** | The disk or volume is **gone**. Nothing to restore, nobody to ask. |
-| **SourceUnattached** | The disk still exists but its **VM was deleted**. One step from orphaned. |
-| **SourceActive** | Attached to a live machine. Not an orphan — judge it on age. |
-| **Unverifiable** | No provable source. Needs a human. |
-| **InUse** | Backing a live image or AMI. Leave alone. |
-| **Protected** | Azure Backup, Site Recovery, AWS Backup, DLM, keep-tags, locks. |
+| **Orphaned** | The source disk or volume no longer exists — nothing to restore, no owner to ask. |
+| **SourceUnattached** | The disk is still there, but the VM it belonged to was deleted. Usually the next thing to look at after Orphaned. |
+| **SourceActive** | Attached to a machine that's still running. Not an orphan, so it's worth judging on age rather than deleting outright. |
+| **Unverifiable** | We can't confirm whether the source still exists. Needs a person to check. |
+| **InUse** | Backing a live image or AMI, so it's still doing a job. Leave it alone. |
+| **Protected** | Covered by Azure Backup, Site Recovery, AWS Backup, DLM, a keep-tag, or a lock. |
 
-**3. What each of those costs**, per month and per year, and what share of the bill it is.
+From there the report gives you:
 
-**4. Cost by age**, so "snapshots older than a year are costing us X" is one glance.
-
-**5. Cost by region** — and by subscription and resource group on Azure, by account on AWS — so you can
-see where the spend sits. Each is shown both for the whole estate and excluding Commvault. A breakdown
-with only one value (a single-region estate) is skipped rather than repeating the total.
+- **Cost per category**, per month and per year, plus each category's share of the total bill.
+- **Cost by age**, so it's obvious at a glance how much snapshots over a year old are costing.
+- **Cost by region** — also by subscription and resource group on Azure, and by account on AWS — shown
+  both across the whole estate and with Commvault excluded. If a breakdown would only have one value
+  (a single-region estate, say), it's left out rather than just repeating the total.
 
 ### What gets scanned
 
-**By default the AWS script covers VM disks only** — EBS snapshots. Databases are a separate
-conversation with a separate owner, so RDS is opt-in:
+By default the AWS script only looks at VM disks — EBS snapshots. Databases are a separate
+conversation with a separate owner, so RDS snapshots are opt-in:
 
 ```powershell
 .\AWS_Orphaned_Snapshots.ps1                          # EBS only
@@ -61,31 +62,32 @@ conversation with a separate owner, so RDS is opt-in:
 ```
 
 Every row carries a `SnapshotType` of `EBS`, `RDS-Instance` or `RDS-Cluster`, so you can filter either
-way after the fact. RDS rows have exactly the same columns as EBS rows — same categories, same age
-bands, same cost columns — so nothing special is needed to work with them.
+way afterwards. RDS rows use the same columns as EBS rows — same categories, age bands and cost
+columns — so there's nothing extra to learn to work with them.
 
-When RDS is included, the report adds a **By snapshot type** breakdown. On a default run that table is
-hidden rather than showing a pointless "100% EBS" row.
+When RDS is included, the report adds a "By snapshot type" breakdown. On a default run that table is
+left out rather than showing a pointless "100% EBS" row.
 
-Only *manual* RDS snapshots are considered. Automated ones follow RDS's own retention and are not
-yours to delete.
+Only manual RDS snapshots are considered. Automated snapshots follow RDS's own retention policy, so
+they're left alone.
 
 ### Filtering and pivoting
 
-**The per-snapshot CSVs are the ones to work in.** One row per snapshot, every dimension on every row,
-with the columns you filter on first:
+The per-snapshot CSVs are the ones to actually work in: one row per snapshot, every dimension on every
+row, with the columns you're most likely to filter on placed first:
 
 ```
 Azure:  SubscriptionName, ResourceGroupName, Location, Name, Ownership, Creator, Category, Action, AgeBand, ...
 AWS:    AccountId, Region, SnapshotType, SnapshotId, Name, Ownership, Creator, Category, Action, AgeBand, ...
 ```
 
-Filter by region, by category, by ownership, by age band — or drop the lot into a pivot table. Costs
-(`EstMonthlyCost`, `EstAnnualCost`, `Currency`) are on every row, so any subtotal you build is correct.
+Filter by region, category, ownership or age band, or just drop the whole thing into a pivot table.
+Cost columns (`EstMonthlyCost`, `EstAnnualCost`, `Currency`) are on every row, so any subtotal you
+build off it will be correct.
 
-`Cost_Summary` is the same data pre-aggregated to one row per combination. It is a single grain
-throughout, so it filters the same way and its cost column sums to the estate total — useful if you
-want the numbers without building a pivot.
+`Cost_Summary` is the same data pre-aggregated to one row per combination. It stays at a single grain
+throughout, so it filters the same way and its cost column sums to the estate total — handy if you
+want the numbers without building your own pivot.
 
 ---
 
@@ -115,8 +117,8 @@ That deletes nothing. Open the HTML report.
 .\Azure_Orphaned_Snapshots.ps1 -DeleteFromReport .\reports\Azure_Snapshots_Candidates_...csv -Delete
 ```
 
-By default only **Orphaned** snapshots are ever in scope. To go after the bigger pile — old snapshots
-whose VM is gone — name it explicitly:
+By default only Orphaned snapshots are in scope for deletion. To also go after the bigger pile — old
+snapshots whose VM is gone — name it explicitly:
 
 ```powershell
 .\Azure_Orphaned_Snapshots.ps1 -AllSubscriptions -DeleteScope Orphaned,SourceUnattached -Delete -WhatIf
@@ -126,8 +128,8 @@ whose VM is gone — name it explicitly:
 
 ## How Commvault snapshots are recognised
 
-Commvault stamps the snapshots it creates. The scripts read those stamps — nothing is inferred, and
-nothing needs to be looked up anywhere else.
+Commvault stamps every snapshot it creates, and the scripts just read those stamps. Nothing here is
+inferred, and there's nothing to look up anywhere else.
 
 **Azure** — `COMMVAULT` in the snapshot name, and a `CreatedBy=Commvault` tag:
 
@@ -146,25 +148,26 @@ _GX_BACKUP_           (no value)
 Name                  SP_2_8465372_40229960_1789636362
 ```
 
-Each marker is checked independently, so a snapshot that has been renamed or re-tagged by hand is still
+Each marker is checked independently, so a snapshot that's been renamed or re-tagged by hand is still
 recognised. On AWS a snapshot also inherits Commvault ownership from the AMI it backs.
 
-If a `-Delete` run finds **no** Commvault snapshots at all, it stops before deleting anything — in an
-estate running Commvault that means the markers missed, not that Commvault is absent.
+If a `-Delete` run finds no Commvault snapshots at all, it stops before deleting anything. In an
+estate that actually runs Commvault, that almost always means the markers missed something rather
+than Commvault being absent.
 
 ---
 
 ## Safety
 
-- **Report-only unless you pass `-Delete`.**
-- **`-DeleteScope` defaults to `Orphaned`.** Commvault, backup services, keep-tags, locks and
+- Report-only unless you pass `-Delete`.
+- `-DeleteScope` defaults to `Orphaned`. Commvault, backup services, keep-tags, locks and
   image-backing snapshots can never be put in scope, even by editing the CSV.
-- **Two age bars.** 30 days for orphans; 365 for anything whose source still exists.
-- **`-WhatIf` and `-Confirm`** are supported, and you must type `DELETE` unless `-Force` is set.
-- **`-MaxDeletions`** caps a run.
-- **You choose the list.** `-DeleteFromReport` removes exactly the rows left in a file you reviewed.
+- Two age bars: 30 days for orphans, 365 for anything whose source still exists.
+- `-WhatIf` and `-Confirm` are supported, and you have to type `DELETE` unless `-Force` is set.
+- `-MaxDeletions` caps a run.
+- You choose the list — `-DeleteFromReport` removes exactly the rows left in a file you've reviewed.
 
-Deletion is permanent. Snapshots cannot be recovered once removed.
+Deletion is permanent. Snapshots can't be recovered once removed.
 
 ---
 
@@ -193,13 +196,14 @@ Set your own rates before quoting anything:
 -Currency 'GBP'
 ```
 
-Rates vary by region and agreement. Two things to know about accuracy:
+Rates vary by region and agreement, so plug in your own. Two things worth knowing about accuracy:
 
-- **AWS figures are close.** They use the snapshot's real billed size, not the volume size.
-- **Azure figures are an upper bound.** Azure gives no per-snapshot consumed size for incremental
-  snapshots, so cost is calculated against provisioned size and the real bill will be lower.
+- AWS figures are close to the real bill, because they use the snapshot's actual billed size rather
+  than the volume size.
+- Azure figures are an upper bound. Azure doesn't expose a per-snapshot consumed size for incremental
+  snapshots, so the cost is calculated against provisioned size — the real bill will usually be lower.
 
-Use these to prioritise, not to forecast.
+Treat these numbers as a way to prioritise, not as a forecast.
 
 ---
 
@@ -210,19 +214,20 @@ Use these to prioritise, not to forecast.
 **AWS** — PowerShell 7+, and `AWS.Tools.Common`, `AWS.Tools.EC2`. Add `AWS.Tools.RDS` for
 `-IncludeRdsSnapshots`, and `AWS.Tools.SecurityToken` so reports carry the account id.
 
-Add `-AutoInstallModules` to install what is missing.
+Add `-AutoInstallModules` to install what's missing.
 
 ---
 
 ## Permissions
 
-Reporting needs read access only. Deletion needs one extra permission on top. Grant the read set
-first, run it, and only add the delete permission when you are ready to act.
+Reporting only needs read access. Deletion needs one extra permission on top of that. It's worth
+granting the read set first, running a report, and only adding the delete permission once you're
+ready to act on it.
 
 ### Azure
 
-**To report** — the built-in **Reader** role on each subscription in scope is enough. It covers
-everything below.
+To report, the built-in Reader role on each subscription in scope is enough — it covers everything
+below.
 
 | Action | Used for |
 |---|---|
@@ -233,8 +238,8 @@ everything below.
 | `Microsoft.Authorization/locks/read` | Honouring resource locks |
 | `Microsoft.Resources/subscriptions/read` | Enumerating subscriptions for `-AllSubscriptions` |
 
-**To delete**, add `Microsoft.Compute/snapshots/delete`. The built-in **Disk Snapshot Contributor**
-role covers it; **Contributor** also works but grants far more than this needs.
+To delete, add `Microsoft.Compute/snapshots/delete`. The built-in Disk Snapshot Contributor role
+covers it. Contributor also works, but it grants far more than this actually needs.
 
 Least-privilege custom role for the delete step:
 
@@ -261,7 +266,7 @@ Least-privilege custom role for the delete step:
 
 ### AWS
 
-**To report** — the AWS-managed **`ReadOnlyAccess`** policy is more than enough, or use this:
+To report, the AWS-managed `ReadOnlyAccess` policy is more than enough, or use this:
 
 ```json
 {
@@ -286,13 +291,13 @@ Least-privilege custom role for the delete step:
 | `ec2:DescribeSnapshots` | Finding the snapshots and their tags |
 | `ec2:DescribeVolumes` | Whether the source volume exists, and whether an instance is attached |
 | `ec2:DescribeImages` | Snapshots backing an AMI, and inheriting Commvault ownership from it |
-| `ec2:DescribeRegions` | Enumerating regions when `-Region` is not given |
+| `ec2:DescribeRegions` | Enumerating regions when `-Region` isn't given |
 | `sts:GetCallerIdentity` | Labelling the report with the account id (optional) |
 | `ec2:DescribeSnapshotAttribute` | Only with `-CheckSharing` |
 | `rds:DescribeDBInstances`<br>`rds:DescribeDBClusters`<br>`rds:DescribeDBSnapshots`<br>`rds:DescribeDBClusterSnapshots` | Only with `-IncludeRdsSnapshots` |
 
-**To delete**, add `ec2:DeleteSnapshot` — plus `rds:DeleteDBSnapshot` and
-`rds:DeleteDBClusterSnapshot` if you are including RDS:
+To delete, add `ec2:DeleteSnapshot` — plus `rds:DeleteDBSnapshot` and `rds:DeleteDBClusterSnapshot`
+if you're including RDS:
 
 ```json
 {
@@ -306,9 +311,9 @@ Least-privilege custom role for the delete step:
 }
 ```
 
-`Resource: "*"` is required because the snapshots to delete are not known until the report has run.
-To narrow it, scope the delete statement with a condition on a tag you control, and exclude anything
-you never want touched:
+`Resource: "*"` is needed because you don't know which snapshots you'll be deleting until after the
+report has run. If you want to narrow it down, add a condition on a tag you control and explicitly
+exclude anything you never want touched:
 
 ```json
 {
@@ -327,14 +332,14 @@ you never want touched:
 }
 ```
 
-A Deny like that is a useful backstop: the scripts already refuse to delete Commvault snapshots, and
-this stops anything else doing so either.
+A Deny like this is a useful backstop — the scripts already refuse to delete Commvault snapshots, and
+this makes sure nothing else can either.
 
 ### Multiple accounts and subscriptions
 
 Azure reads every subscription the signed-in identity can see, so `Reader` at management-group level
-covers a whole tenant. AWS uses one credential profile at a time — pass `-ProfileName prod,dev` and
-give each profile its own role.
+covers a whole tenant. AWS works through one credential profile at a time — pass
+`-ProfileName prod,dev` and give each profile its own role.
 
 ---
 
@@ -366,9 +371,9 @@ give each profile its own role.
 .\Test-SnapshotLogic.ps1
 ```
 
-220 checks covering the categories, age bars, delete scoping, both clouds' Commvault markers, cost
-arithmetic and currency formatting. Runs offline in a second. **Run it if you change a marker or an age
-bar.**
+192 checks covering the categories, age bars, delete scoping, both clouds' Commvault markers, cost
+arithmetic and currency formatting. Runs offline in about a second — worth running any time you change
+a marker or an age bar.
 
 ---
 
@@ -377,5 +382,5 @@ bar.**
 Azure NetApp Files, AWS FSx/Redshift/DocumentDB, orphaned AMIs themselves, and unattached disks and
 volumes.
 
-The classification and reporting code is identical in both scripts, so each can be copied and run on its
-own. Change it in one, change it in the other, and re-run the tests.
+The classification and reporting code is identical in both scripts, so either one can be copied out
+and run on its own. If you change it in one, change it in the other and re-run the tests.
